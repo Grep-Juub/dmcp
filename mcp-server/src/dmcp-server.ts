@@ -8,7 +8,7 @@
  * 
  * Key features:
  * - Exposes ONLY search_tools meta-tool (no admin operations)
- * - Connects to backend SSE servers for tool forwarding
+ * - Connects to backend SSE servers LAZILY (on first tool call)
  * - Dynamic tool list based on semantic search
  * - Sends listChanged notifications when tools update
  * 
@@ -52,6 +52,11 @@ function sanitizeToolName(name: string): string {
 
 /**
  * DMCP Server - Runtime for dynamic tool discovery
+ * 
+ * LAZY ARCHITECTURE:
+ * - Only connects to Redis at startup (fast!)
+ * - Backend MCP servers are connected ON-DEMAND when a tool is called
+ * - Tool metadata comes from Redis, not from querying backends
  */
 class DMCPServer {
   private server: Server;
@@ -60,10 +65,9 @@ class DMCPServer {
   // Currently exposed tools (dynamic subset)
   private exposedTools: Map<string, Tool> = new Map();
   
-  // Mappings for tool forwarding
-  private toolToServer: Map<string, string> = new Map();
-  private toolOriginalNames: Map<string, string> = new Map();
+  // Lazy connection pool for backend servers
   private serverClients: Map<string, Client> = new Map();
+  private serverConfig: MCPConfig | null = null;
   
   // Configuration
   private topK: number;
@@ -97,7 +101,6 @@ class DMCPServer {
       host: process.env.REDIS_HOST || 'localhost',
       port: parseInt(process.env.REDIS_PORT || '6380'),
       password: process.env.REDIS_PASSWORD,
-      embeddingURL: process.env.EMBEDDING_URL || 'http://localhost:5000',
       embeddingDimensions: 384,
     });
 
@@ -186,17 +189,18 @@ class DMCPServer {
   }
 
   /**
-   * Connect to an SSE MCP Server
+   * Connect to an SSE MCP Server (lazy - on demand)
    */
   private async connectToSSEServer(serverId: string, url: string): Promise<Client | null> {
     try {
-      console.error(`[DMCP] Connecting to ${serverId}...`);
+      console.error(`[DMCP] Lazy connecting to ${serverId}...`);
       const transport = new SSEClientTransport(new URL(url));
       const client = new Client(
         { name: 'dmcp-client', version: '1.0.0' },
         { capabilities: {} }
       );
       await client.connect(transport);
+      console.error(`[DMCP] ✓ Connected to ${serverId}`);
       return client;
     } catch (error) {
       console.error(`[DMCP] Failed to connect to ${serverId}:`, (error as Error).message);
@@ -205,38 +209,30 @@ class DMCPServer {
   }
 
   /**
-   * Connect to backend servers and build tool mapping
-   * Does NOT index - assumes tools are already in Redis
+   * Get or create a client connection to a backend server (lazy)
    */
-  private async connectToBackends(config: MCPConfig): Promise<void> {
-    console.error('[DMCP] Connecting to backend MCP servers...');
-
-    for (const [serverId, serverConfig] of Object.entries(config.mcpServers)) {
-      if (serverConfig.type !== 'sse' || !serverConfig.url) {
-        continue;
-      }
-
-      const client = await this.connectToSSEServer(serverId, serverConfig.url);
-      if (!client) continue;
-
-      this.serverClients.set(serverId, client);
-
-      try {
-        const result = await client.listTools();
-        console.error(`[DMCP] ${serverId}: ${result.tools.length} tools`);
-
-        // Build mappings for tool forwarding
-        for (const tool of result.tools) {
-          const toolKey = sanitizeToolName(`${serverId}_${tool.name}`);
-          this.toolToServer.set(toolKey, serverId);
-          this.toolOriginalNames.set(toolKey, tool.name);
-        }
-      } catch (error) {
-        console.error(`[DMCP] Failed to list tools from ${serverId}:`, (error as Error).message);
-      }
+  private async getServerClient(serverId: string): Promise<Client | null> {
+    // Return existing connection
+    if (this.serverClients.has(serverId)) {
+      return this.serverClients.get(serverId)!;
     }
 
-    console.error(`[DMCP] Connected to ${this.serverClients.size} backend servers`);
+    // Lazy connect
+    if (!this.serverConfig) {
+      throw new Error('Server config not loaded');
+    }
+
+    const serverCfg = this.serverConfig.mcpServers[serverId];
+    if (!serverCfg || serverCfg.type !== 'sse' || !serverCfg.url) {
+      console.error(`[DMCP] No SSE config for server: ${serverId}`);
+      return null;
+    }
+
+    const client = await this.connectToSSEServer(serverId, serverCfg.url);
+    if (client) {
+      this.serverClients.set(serverId, client);
+    }
+    return client;
   }
 
   /**
@@ -303,11 +299,34 @@ class DMCPServer {
   }
 
   /**
-   * Forward tool call to backend MCP server
+   * Parse tool name to extract serverId and original name
+   * Format: serverId_originalName (sanitized)
+   */
+  private parseToolName(toolName: string): { serverId: string; originalName: string } | null {
+    // Tool names are formatted as: serverId_originalToolName (all lowercase, sanitized)
+    // We need to find the server from the exposed tools map
+    const tool = this.exposedTools.get(toolName);
+    if (!tool) return null;
+
+    // Extract serverId from the description which has format: [serverId] description
+    const match = tool.description?.match(/^\[([^\]]+)\]/);
+    if (!match) return null;
+
+    const serverId = match[1];
+    // Original name is toolName with serverId prefix removed
+    const prefix = sanitizeToolName(serverId) + '_';
+    if (!toolName.startsWith(prefix)) return null;
+    
+    const originalName = toolName.slice(prefix.length);
+    return { serverId, originalName };
+  }
+
+  /**
+   * Forward tool call to backend MCP server (lazy connection)
    */
   private async forwardToolCall(toolName: string, args: Record<string, unknown>): Promise<{ content: Array<{ type: string; text: string }> }> {
-    const serverId = this.toolToServer.get(toolName);
-    if (!serverId) {
+    const parsed = this.parseToolName(toolName);
+    if (!parsed) {
       return {
         content: [{
           type: 'text',
@@ -316,14 +335,12 @@ class DMCPServer {
       };
     }
 
-    const client = this.serverClients.get(serverId);
-    if (!client) {
-      throw new Error(`Server not connected: ${serverId}`);
-    }
+    const { serverId, originalName } = parsed;
 
-    const originalName = this.toolOriginalNames.get(toolName);
-    if (!originalName) {
-      throw new Error(`Original name not found for: ${toolName}`);
+    // Lazy connect to backend server
+    const client = await this.getServerClient(serverId);
+    if (!client) {
+      throw new Error(`Cannot connect to server: ${serverId}`);
     }
 
     console.error(`[DMCP] Forwarding to ${serverId}: ${originalName}`);
@@ -370,7 +387,8 @@ class DMCPServer {
   }
 
   /**
-   * Background initialization
+   * Background initialization - LAZY: only connects to Redis, not to backends
+   * Backend connections are made on-demand when tools are called
    */
   private async initializeInBackground(configPath: string): Promise<void> {
     try {
@@ -388,15 +406,16 @@ class DMCPServer {
         console.error(`[DMCP] ✓ Found ${this.totalToolCount} indexed tools`);
       }
 
-      // Load config and connect to backends
-      const config = this.loadMCPConfig(configPath);
-      await this.connectToBackends(config);
+      // Load config for lazy backend connections (NO connections yet!)
+      this.serverConfig = this.loadMCPConfig(configPath);
+      const serverCount = Object.keys(this.serverConfig.mcpServers).length;
+      console.error(`[DMCP] Loaded config with ${serverCount} backend servers (lazy connection)`);
       
       // Update search tool description with actual count
       this.exposedTools.set('mcp_dmcp_search_tools', this.getSearchToolDefinition());
       
       this.isInitialized = true;
-      console.error(`[DMCP] ✓ Ready - ${this.totalToolCount} tools searchable, 1 meta-tool exposed`);
+      console.error(`[DMCP] ✓ Ready - ${this.totalToolCount} tools searchable, backends connect on-demand`);
     } catch (error) {
       console.error('[DMCP] Initialization error:', error);
       this.initializationError = error as Error;
