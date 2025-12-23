@@ -18,6 +18,7 @@
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { SSEClientTransport } from '@modelcontextprotocol/sdk/client/sse.js';
 import { RedisVSS, ToolMetadata } from './redis-vss.js';
+import { EmbeddingClassifier, classifyToolHeuristic } from './tool-classifier.js';
 import { readFileSync } from 'fs';
 import { join } from 'path';
 import { homedir } from 'os';
@@ -41,6 +42,7 @@ interface IndexerOptions {
   redisPort: number;
   redisPassword?: string;
   embeddingURL: string;
+  classifyTools: boolean;
 }
 
 /**
@@ -55,6 +57,7 @@ function parseArgs(): IndexerOptions {
     redisPort: parseInt(process.env.REDIS_PORT || '6380'),
     redisPassword: process.env.REDIS_PASSWORD,
     embeddingURL: process.env.EMBEDDING_URL || 'http://localhost:5000',
+    classifyTools: process.env.CLASSIFY_TOOLS !== 'false',  // Default: true
   };
 
   for (let i = 0; i < args.length; i++) {
@@ -75,6 +78,12 @@ function parseArgs(): IndexerOptions {
         break;
       case '--embedding-url':
         options.embeddingURL = args[++i];
+        break;
+      case '--no-classify':
+        options.classifyTools = false;
+        break;
+      case '--classify':
+        options.classifyTools = true;
         break;
       case '--help':
       case '-h':
@@ -98,6 +107,8 @@ Options:
   --redis-host <host>       Redis host (default: localhost, env: REDIS_HOST)
   --redis-port <port>       Redis port (default: 6380, env: REDIS_PORT)
   --embedding-url <url>     Embedding service URL (default: http://localhost:5000, env: EMBEDDING_URL)
+  --classify                Enable embedding-based classification (default: on)
+  --no-classify             Disable classification, use heuristics only
   -h, --help                Show this help message
 
 Environment Variables:
@@ -106,11 +117,13 @@ Environment Variables:
   REDIS_PORT                Redis port
   REDIS_PASSWORD            Redis password
   EMBEDDING_URL             Embedding service URL
+  CLASSIFY_TOOLS            Set to 'false' to disable classification
 
 Examples:
   npm run index                           # Index with defaults
   npm run index -- --force                # Force re-index
   npm run index -- -c /path/to/mcp.json   # Custom config
+  npm run index -- --no-classify          # Skip embedding classification
 `);
 }
 
@@ -257,6 +270,55 @@ async function main() {
       await redis.disconnect();
       process.exit(1);
     }
+
+    // ============ CLASSIFICATION STEP ============
+    console.log('🏷️  Classifying tools...');
+    
+    const classificationStartTime = Date.now();
+    
+    if (options.classifyTools) {
+      console.log('   Using embedding-based classification');
+      
+      const classifier = new EmbeddingClassifier({
+        embeddingURL: options.embeddingURL,
+      });
+
+      const classifications = await classifier.classifyBatch(
+        tools.map(t => ({ name: t.name, description: t.description })),
+        (current, total) => {
+          const percent = Math.floor((current / total) * 100);
+          process.stdout.write(`\r   Classifying: ${percent}% (${current}/${total})     `);
+        }
+      );
+      
+      process.stdout.write('\r' + ' '.repeat(60) + '\r');
+
+      // Apply classifications to tools
+      for (const tool of tools) {
+        const result = classifications.get(tool.name);
+        tool.category = result?.category || 'general';
+      }
+
+      const stats = classifier.getStats(classifications);
+      console.log(`   ✓ Classification complete (${Date.now() - classificationStartTime}ms)`);
+      console.log(`     • meta: ${stats.meta} | query: ${stats.query} | action: ${stats.action} | general: ${stats.general}`);
+    } else {
+      console.log('   Using heuristic classification (--no-classify)');
+      
+      for (const tool of tools) {
+        tool.category = classifyToolHeuristic(tool.name, tool.description);
+      }
+
+      // Count categories
+      const stats = { meta: 0, query: 0, action: 0, general: 0 };
+      for (const tool of tools) {
+        stats[tool.category as keyof typeof stats]++;
+      }
+      
+      console.log(`   ✓ Classification complete`);
+      console.log(`     • meta: ${stats.meta} | query: ${stats.query} | action: ${stats.action} | general: ${stats.general}`);
+    }
+    console.log('');
 
     // Index tools with progress bar
     console.log('📥 Indexing tools in Redis...');

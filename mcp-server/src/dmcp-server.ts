@@ -65,6 +65,14 @@ class DMCPServer {
   // Currently exposed tools (dynamic subset)
   private exposedTools: Map<string, Tool> = new Map();
   
+  // Always-exposed meta tools (LLM enhancement)
+  private metaTools: Map<string, Tool> = new Map();
+  
+  // Tool usage tracking for eviction
+  private toolLastUsed: Map<string, number> = new Map();  // toolKey -> request counter
+  private requestCounter = 0;
+  private readonly EVICTION_THRESHOLD = 5;  // Remove tools not used in N requests
+  
   // Lazy connection pool for backend servers
   private serverClients: Map<string, Client> = new Map();
   private serverConfig: MCPConfig | null = null;
@@ -80,8 +88,8 @@ class DMCPServer {
   private totalToolCount = 0;
 
   constructor() {
-    this.topK = parseInt(process.env.DMCP_TOP_K || '30');
-    this.minScore = parseFloat(process.env.DMCP_MIN_SCORE || '0.25');
+    this.topK = parseInt(process.env.DMCP_TOP_K || '15');
+    this.minScore = parseFloat(process.env.DMCP_MIN_SCORE || '0.3');
     
     this.server = new Server(
       {
@@ -148,6 +156,8 @@ class DMCPServer {
 
   /**
    * Update exposed tools based on search results
+   * Merges new tools with recently-used tools and evicts stale ones
+   * Always includes meta tools (LLM enhancement)
    */
   private updateExposedTools(filteredTools: FilteredTool[]) {
     const newExposed = new Map<string, Tool>();
@@ -155,7 +165,12 @@ class DMCPServer {
     // Always include the search meta-tool
     newExposed.set('mcp_dmcp_search_tools', this.getSearchToolDefinition());
     
-    // Add filtered tools
+    // Always include meta tools (LLM enhancement - sequential-thinking, etc.)
+    for (const [toolKey, tool] of this.metaTools) {
+      newExposed.set(toolKey, tool);
+    }
+    
+    // Add new filtered tools from search
     for (const tool of filteredTools) {
       const toolKey = sanitizeToolName(`${tool.serverId}_${tool.name}`);
       newExposed.set(toolKey, {
@@ -163,6 +178,27 @@ class DMCPServer {
         description: `[${tool.serverId}] ${tool.description}`,
         inputSchema: tool.inputSchema || { type: 'object', properties: {} },
       });
+      // Mark as fresh (will be kept)
+      this.toolLastUsed.set(toolKey, this.requestCounter);
+    }
+    
+    // Keep recently-used tools that aren't in the new search results
+    for (const [toolKey, tool] of this.exposedTools) {
+      if (toolKey === 'mcp_dmcp_search_tools') continue;
+      if (this.metaTools.has(toolKey)) continue;  // Skip meta tools (always kept)
+      if (newExposed.has(toolKey)) continue;
+      
+      const lastUsed = this.toolLastUsed.get(toolKey) || 0;
+      const age = this.requestCounter - lastUsed;
+      
+      if (age < this.EVICTION_THRESHOLD) {
+        // Keep this tool - it was used recently
+        newExposed.set(toolKey, tool);
+      } else {
+        // Evict this stale tool
+        this.toolLastUsed.delete(toolKey);
+        console.error(`[DMCP] Evicted stale tool: ${toolKey} (unused for ${age} requests)`);
+      }
     }
     
     // Check if tools actually changed
@@ -266,6 +302,56 @@ class DMCPServer {
   }
 
   /**
+   * Parse query to detect CRUD intent for smarter filtering
+   * Returns intent type: 'read', 'create', 'update', 'delete', or null (no specific intent)
+   */
+  private parseQueryIntent(query: string): 'read' | 'create' | 'update' | 'delete' | null {
+    const q = query.toLowerCase();
+    
+    // Read intent
+    if (/\b(get|read|fetch|list|search|find|show|view|query|check|retrieve)\b/.test(q)) {
+      return 'read';
+    }
+    // Create intent
+    if (/\b(create|add|new|post|insert|make|write)\b/.test(q)) {
+      return 'create';
+    }
+    // Update intent
+    if (/\b(update|edit|modify|change|patch|put|set|assign)\b/.test(q)) {
+      return 'update';
+    }
+    // Delete intent
+    if (/\b(delete|remove|drop|destroy|clear|unset)\b/.test(q)) {
+      return 'delete';
+    }
+    
+    return null;
+  }
+
+  /**
+   * Filter tools by intent (CRUD operation matching)
+   */
+  private filterByIntent(tools: FilteredTool[], intent: 'read' | 'create' | 'update' | 'delete'): FilteredTool[] {
+    const patterns: Record<string, RegExp> = {
+      read: /\b(get|read|list|search|find|query|fetch|retrieve|show)\b/i,
+      create: /\b(create|add|post|insert|new|write)\b/i,
+      update: /\b(update|edit|put|patch|modify|set|assign)\b/i,
+      delete: /\b(delete|remove|drop|destroy|clear)\b/i,
+    };
+    
+    const pattern = patterns[intent];
+    
+    // Filter to tools matching the intent
+    const matching = tools.filter(t => {
+      const text = `${t.name} ${t.description}`.toLowerCase();
+      return pattern.test(text);
+    });
+    
+    // If we found matching tools, return them; otherwise return all (fallback)
+    return matching.length > 0 ? matching : tools;
+  }
+
+  /**
    * Handle the search_tools meta-tool
    */
   private async handleSearchTools(args: Record<string, unknown>): Promise<{ content: Array<{ type: string; text: string }> }> {
@@ -274,12 +360,27 @@ class DMCPServer {
 
     console.error(`[DMCP] Searching: "${query}" (limit: ${limit})`);
 
-    const filteredTools = await this.redis.search(query, {
+    // Detect intent from query
+    const intent = this.parseQueryIntent(query);
+    if (intent) {
+      console.error(`[DMCP] Detected intent: ${intent}`);
+    }
+
+    let filteredTools = await this.redis.search(query, {
       topK: limit,
       minScore: this.minScore,
     });
 
-    console.error(`[DMCP] Found ${filteredTools.length} relevant tools`);
+    console.error(`[DMCP] Found ${filteredTools.length} tools from Redis`);
+
+    // Apply intent filtering if detected
+    if (intent && filteredTools.length > 3) {
+      const beforeCount = filteredTools.length;
+      filteredTools = this.filterByIntent(filteredTools, intent);
+      if (filteredTools.length < beforeCount) {
+        console.error(`[DMCP] Intent filter: ${beforeCount} → ${filteredTools.length} tools`);
+      }
+    }
 
     // Update exposed tools and notify
     this.updateExposedTools(filteredTools);
@@ -325,6 +426,9 @@ class DMCPServer {
    * Forward tool call to backend MCP server (lazy connection)
    */
   private async forwardToolCall(toolName: string, args: Record<string, unknown>): Promise<{ content: Array<{ type: string; text: string }> }> {
+    // Increment request counter on each tool call
+    this.requestCounter++;
+    
     const parsed = this.parseToolName(toolName);
     if (!parsed) {
       return {
@@ -336,6 +440,9 @@ class DMCPServer {
     }
 
     const { serverId, originalName } = parsed;
+    
+    // Mark tool as used (prevents eviction)
+    this.toolLastUsed.set(toolName, this.requestCounter);
 
     // Lazy connect to backend server
     const client = await this.getServerClient(serverId);
@@ -404,6 +511,23 @@ class DMCPServer {
         console.error('[DMCP] Run "npm run index" first to index tools.');
       } else {
         console.error(`[DMCP] ✓ Found ${this.totalToolCount} indexed tools`);
+      }
+
+      // Load meta tools (always exposed for LLM enhancement)
+      const metaToolsFromRedis = await this.redis.getToolsByCategory('meta');
+      for (const tool of metaToolsFromRedis) {
+        const toolKey = sanitizeToolName(`${tool.serverId}_${tool.name}`);
+        this.metaTools.set(toolKey, {
+          name: toolKey,
+          description: `[${tool.serverId}] ${tool.description}`,
+          inputSchema: tool.inputSchema || { type: 'object', properties: {} },
+        });
+        // Also add to exposed tools immediately
+        this.exposedTools.set(toolKey, this.metaTools.get(toolKey)!);
+      }
+      
+      if (this.metaTools.size > 0) {
+        console.error(`[DMCP] ✓ Loaded ${this.metaTools.size} always-available meta tools`);
       }
 
       // Load config for lazy backend connections (NO connections yet!)

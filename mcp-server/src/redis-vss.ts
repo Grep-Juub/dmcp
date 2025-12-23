@@ -476,6 +476,43 @@ export class RedisVSS {
   }
 
   /**
+   * Get all tools in a specific category
+   * Used to always expose 'meta' category tools for LLM enhancement
+   */
+  async getToolsByCategory(category: string): Promise<FilteredTool[]> {
+    const tools: FilteredTool[] = [];
+
+    try {
+      const results = await this.client.ft.search(
+        this.indexName,
+        `@category:{${category}}`,
+        {
+          RETURN: ['serverId', 'name', 'description', 'category', 'inputSchema'],
+          LIMIT: { from: 0, size: 100 }  // Assume < 100 meta tools
+        }
+      );
+
+      for (const doc of results.documents) {
+        tools.push({
+          id: doc.id.split(':')[2],
+          serverId: doc.value.serverId as string,
+          name: doc.value.name as string,
+          description: doc.value.description as string,
+          category: doc.value.category as string,
+          inputSchema: doc.value.inputSchema,
+          score: 1.0  // Always-exposed tools get perfect score
+        });
+      }
+
+      console.error(`[RedisVSS] Found ${tools.length} tools with category '${category}'`);
+    } catch (error) {
+      console.error(`[RedisVSS] Error fetching ${category} tools:`, (error as Error).message);
+    }
+
+    return tools;
+  }
+
+  /**
    * Health check
    */
   async healthCheck(): Promise<{
