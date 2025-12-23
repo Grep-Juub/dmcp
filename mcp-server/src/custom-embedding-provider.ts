@@ -58,35 +58,47 @@ export class LocalEmbeddingProvider implements EmbeddingProvider {
   }
 
   /**
-   * Embed multiple texts in batch.
+   * Embed multiple texts in batch with retry logic.
    * @param texts Array of texts to embed
    * @param prefix "query" for search queries, "passage" for documents (default)
    */
   async embedBatch(texts: string[], prefix: 'query' | 'passage' = 'passage'): Promise<Float32Array[]> {
-    try {
-      const response = await fetch(`${this.baseURL}/embed`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({ texts, prefix }),
-      });
+    const maxRetries = 3;
+    let lastError: Error | null = null;
 
-      if (!response.ok) {
-        throw new Error(`Embedding API error: ${response.status} ${await response.text()}`);
+    for (let attempt = 1; attempt <= maxRetries; attempt++) {
+      try {
+        const response = await fetch(`${this.baseURL}/embed`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({ texts, prefix }),
+        });
+
+        if (!response.ok) {
+          throw new Error(`Embedding API error: ${response.status} ${await response.text()}`);
+        }
+
+        const data: any = await response.json();
+        
+        if (!data.embeddings) {
+          throw new Error('Invalid response from embedding service');
+        }
+
+        return data.embeddings.map((emb: number[]) => new Float32Array(emb));
+      } catch (error) {
+        lastError = error as Error;
+        if (attempt < maxRetries) {
+          const delay = attempt * 1000; // 1s, 2s, 3s backoff
+          console.error(`[Retry ${attempt}/${maxRetries}] Embedding service error, retrying in ${delay}ms...`);
+          await new Promise(r => setTimeout(r, delay));
+        }
       }
-
-      const data: any = await response.json();
-      
-      if (!data.embeddings) {
-        throw new Error('Invalid response from embedding service');
-      }
-
-      return data.embeddings.map((emb: number[]) => new Float32Array(emb));
-    } catch (error) {
-      console.error('Error calling embedding service:', error);
-      throw error;
     }
+
+    console.error('Error calling embedding service after retries:', lastError);
+    throw lastError;
   }
 
   getDimensions(): number {

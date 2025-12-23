@@ -212,7 +212,7 @@ export class RedisVSS {
 
     // Process in chunks with concurrency for better throughput
     const CHUNK_SIZE = 16;
-    const CONCURRENCY = 3; // Process 3 chunks in parallel
+    const CONCURRENCY = 2; // Process 2 chunks in parallel (reduced for stability)
     
     const allEmbeddings: Float32Array[] = new Array(tools.length);
     let processed = 0;
