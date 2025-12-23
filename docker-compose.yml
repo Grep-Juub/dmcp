@@ -1,0 +1,101 @@
+services:
+  # Redis with Vector Search for semantic tool filtering
+  redis-vss:
+    image: redis/redis-stack-server:latest
+    container_name: mcp-redis-vss
+    ports:
+      - "6380:6379"      # Redis on alternate port (6380) to avoid conflict
+    volumes:
+      - redis-vss-data:/data
+    environment:
+      - REDIS_ARGS=--save 60 1 --loglevel warning --protected-mode no
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+    deploy:
+      resources:
+        limits:
+          cpus: '2'
+          memory: 2G
+        reservations:
+          cpus: '1'
+          memory: 512M
+    networks:
+      - mcp-network
+
+  # Fast Embedding Service using ONNX Runtime (~3-5x faster than PyTorch)
+  # Model is configurable via EMBEDDING_MODEL env var
+  embedding-service:
+    # platform: linux/arm64  # Uncomment for Apple Silicon (M1/M2/M3)
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        EMBEDDING_MODEL: ${EMBEDDING_MODEL:-intfloat/e5-small-v2}
+    container_name: mcp-embedding-service
+    ports:
+      - "5000:5000"
+    environment:
+      - PYTHONUNBUFFERED=1
+      - TRANSFORMERS_CACHE=/app/cache
+      - EMBEDDING_MODEL=${EMBEDDING_MODEL:-intfloat/e5-small-v2}
+    volumes:
+      - embedding-model-cache:/app/cache
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: '4'
+          memory: 4G
+        reservations:
+          cpus: '2'
+          memory: 2G
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    networks:
+      - mcp-network
+
+  # MCP Proxy with Redis VSS (optional - for standalone deployment)
+  # Uncomment to run proxy in Docker instead of locally
+  # mcp-proxy:
+  #   build:
+  #     context: ./mcp-server
+  #     dockerfile: Dockerfile.proxy
+  #   container_name: mcp-redis-proxy
+  #   depends_on:
+  #     redis-vss:
+  #       condition: service_healthy
+  #     embedding-service:
+  #       condition: service_healthy
+  #   environment:
+  #     REDIS_HOST: redis-vss
+  #     REDIS_PORT: 6379
+  #     EMBEDDING_URL: http://embedding-service:5000
+  #     FILTER_TOP_K: 30
+  #     FILTER_MIN_SCORE: 0.25
+  #     NODE_ENV: production
+  #   volumes:
+  #     - ${HOME}/Work/mgmt/main/.vscode/mcp.json:/app/mcp-config.json:ro
+  #   restart: unless-stopped
+  #   networks:
+  #     - mcp-network
+  #   # For stdio transport, you'd connect via docker exec
+  #   # For SSE/HTTP, expose ports here
+
+volumes:
+  redis-vss-data:
+    driver: local
+  embedding-model-cache:
+    driver: local
+
+networks:
+  mcp-network:
+    name: mcp-proxy-network
+    driver: bridge

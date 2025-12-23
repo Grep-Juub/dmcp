@@ -1,0 +1,37 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+venv/
+env/
+ENV/
+.venv
+*.log
+.DS_Store
+.cache/
+model-cache/
+*.swp
+*.swo
+*~
+.idea/
+.vscode/
+
+# Node
+node_modules/
+dist/
+
+# Logs and dumps
+*.log
+dump.json
+gateway_dump.json
+
+# Temp directories
+tmp/
+mcp-server/tmp/
+
+# Private configs (contain API keys, tokens, secrets)
+gateway/config_parts/
+gateway/config.yaml
+gateway/agentgateway
+one-mcp/mcp.json

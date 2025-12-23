@@ -1,0 +1,18 @@
+# Agent Gateway Configuration Example
+# Copy this to config_parts/00-header.yaml and customize
+
+listeners:
+  - name: mcp-sse
+    type: sse
+    port_range:
+      min: 3101
+      max: 3199
+
+# Add your MCP server targets below
+# See gateway/config_parts/ for examples of:
+# - 10-core.yaml      (core services)
+# - 20-github.yaml    (GitHub MCP server)
+# - 30-atlassian.yaml (Jira, Confluence)
+# - 40-google.yaml    (Google Workspace)
+# - 50-aws.yaml       (AWS services)
+# - 60-monitoring.yaml (Datadog, Grafana)
