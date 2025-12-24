@@ -14,7 +14,6 @@
 import { createClient } from 'redis';
 import type { RedisClientType } from 'redis';
 import { LocalEmbeddingProvider } from './custom-embedding-provider.js';
-import { HybridSearchEngine } from './hybrid-search.js';
 
 export interface ToolMetadata {
   id: string;
@@ -51,7 +50,6 @@ export interface RedisVSSConfig {
 export class RedisVSS {
   private client: RedisClientType;
   private embeddingProvider: LocalEmbeddingProvider;
-  private hybridSearch: HybridSearchEngine;
   private indexName: string;
   private dimensions: number;
   private isConnected: boolean = false;
@@ -94,12 +92,6 @@ export class RedisVSS {
       provider: 'local',
       baseURL: embeddingURL,
       dimensions: embeddingDimensions,
-    });
-
-    // Initialize hybrid search engine
-    this.hybridSearch = new HybridSearchEngine({
-      bm25Weight: 0.3,    // 30% weight for BM25 (keyword matching)
-      vectorWeight: 0.7,  // 70% weight for vector (semantic matching)
     });
 
     // Suppress repeated error logs (they're expected during reconnect)
@@ -281,42 +273,16 @@ export class RedisVSS {
 
     const duration = Date.now() - startTime;
     console.error(`[RedisVSS] ✓ Indexed ${tools.length} tools in ${duration}ms (${(duration / tools.length).toFixed(1)}ms per tool)`);
-    
-    // Build BM25 index for hybrid search
-    await this.buildBM25Index(tools);
-  }
-
-  /**
-   * Build BM25 index from tools for hybrid search
-   */
-  private async buildBM25Index(tools: ToolMetadata[]): Promise<void> {
-    console.error('[RedisVSS] Building BM25 index for hybrid search...');
-    
-    const documents = tools.map(tool => ({
-      id: `${tool.serverId}:${tool.name}`,
-      text: `${tool.name} ${tool.description}`,
-    }));
-
-    this.hybridSearch.indexDocuments(documents);
   }
 
   /**
    * Search for tools semantically similar to the query
    * 
-   * ENHANCED HYBRID SEARCH STRATEGY (ToolLLM-inspired):
-   * 1. Text search (FT.SEARCH) for exact keyword matches
-   * 2. BM25 search for statistical relevance
-   * 3. Vector search for semantic understanding
-   * 4. Score fusion to combine all approaches
-   * 
-   * This gives us the best of all worlds:
-   * - Fast exact matches: "jira issue", "kubernetes pods"
-   * - Statistical relevance: BM25 ranking
-   * - Semantic matches: "ticket management", "cloud costs"
+   * Uses pure vector search with ToolRet embeddings for semantic understanding.
    * 
    * @param query - User query or context
    * @param options - Search options
-   * @returns Filtered tools with fused similarity scores
+   * @returns Filtered tools with similarity scores
    */
   async search(
     query: string,
@@ -335,9 +301,9 @@ export class RedisVSS {
     } = options;
 
     const startTime = Date.now();
-    const toolScores = new Map<string, { tool: FilteredTool; bm25Score: number; vectorScore: number }>();
+    const toolScores = new Map<string, { tool: FilteredTool; vectorScore: number }>();
 
-    // Build filter for vector/text search
+    // Build filter for vector search
     const filters: string[] = [];
     if (serverIds && serverIds.length > 0) {
       filters.push(`@serverId:{${serverIds.join('|')}}`);
@@ -346,25 +312,9 @@ export class RedisVSS {
       filters.push(`@category:{${categories.join('|')}}`);
     }
 
-    // ============ PHASE 1: BM25 SEARCH ============
-    console.error(`[RedisVSS] Phase 1 - BM25 search: "${query}"`);
-    const bm25Results = this.hybridSearch.searchBM25(query, topK * 2);
-    console.error(`[RedisVSS] BM25 found ${bm25Results.length} results`);
-    
-    // Store BM25 scores
-    for (const result of bm25Results) {
-      const [serverId, name] = result.id.split(':');
-      const toolKey = result.id;
-      toolScores.set(toolKey, {
-        tool: null as any, // Will populate from Redis
-        bm25Score: result.score,
-        vectorScore: 0,
-      });
-    }
-
-    // ============ PHASE 2: VECTOR SEARCH ============
+    // ============ VECTOR SEARCH ============
     const queryEmbedding = await this.embeddingProvider.embed(query, 'query');
-    console.error(`[RedisVSS] Phase 2 - Vector search`);
+    console.error(`[RedisVSS] Vector search for: "${query}"`);
     const vectorBytes = Buffer.from(queryEmbedding.buffer);
 
     let searchQuery = '*';
@@ -419,45 +369,21 @@ export class RedisVSS {
         score: score
       };
 
-      const existing = toolScores.get(toolKey);
-      if (existing) {
-        existing.tool = tool;
-        existing.vectorScore = score;
-      } else {
-        toolScores.set(toolKey, {
-          tool,
-          bm25Score: 0,
-          vectorScore: score,
-        });
-      }
+      toolScores.set(toolKey, {
+        tool,
+        vectorScore: score,
+      });
     }
 
-    // ============ PHASE 3: SCORE FUSION ============
-    console.error(`[RedisVSS] Phase 3 - Fusing scores from BM25 and vector search`);
-    
-    const config = this.hybridSearch.getConfig();
-    const fusedResults: FilteredTool[] = [];
-
-    for (const [toolKey, { tool, bm25Score, vectorScore }] of toolScores) {
-      if (!tool) continue; // BM25 hit but not in Redis vector results
-      
-      // Weighted fusion
-      const fusedScore = config.bm25Weight * bm25Score + config.vectorWeight * vectorScore;
-      
-      if (fusedScore >= minScore) {
-        fusedResults.push({
-          ...tool,
-          score: fusedScore,
-        });
-      }
-    }
-
-    // Sort by fused score
-    fusedResults.sort((a, b) => b.score - a.score);
-    const finalResults = fusedResults.slice(0, topK);
+    // Filter and sort by score
+    const filteredResults: FilteredTool[] = Array.from(toolScores.values())
+      .filter(({ vectorScore }) => vectorScore >= minScore)
+      .map(({ tool }) => tool)
+      .sort((a, b) => b.score - a.score);
+    const finalResults = filteredResults.slice(0, topK);
 
     const duration = Date.now() - startTime;
-    console.error(`[RedisVSS] Found ${finalResults.length} relevant tools in ${duration}ms (hybrid: BM25 + vector)`);
+    console.error(`[RedisVSS] Found ${finalResults.length} relevant tools in ${duration}ms (pure vector search)`);
     
     if (finalResults.length > 0) {
       console.error(`[RedisVSS] Top tool: ${finalResults[0].name} (score: ${finalResults[0].score.toFixed(3)})`);

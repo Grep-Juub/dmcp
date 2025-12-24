@@ -20,7 +20,6 @@ import { SSEClientTransport } from '@modelcontextprotocol/sdk/client/sse.js';
 import { RedisVSS, ToolMetadata } from './redis-vss.js';
 import { EmbeddingClassifier, classifyToolHeuristic, type ToolDomain } from './tool-classifier.js';
 import { CapabilityClusterer, formatDomainStats } from './tool-router.js';
-import { extractKeywords } from './keyword-extractor.js';
 import { readFileSync } from 'fs';
 import { join } from 'path';
 
@@ -30,6 +29,7 @@ interface MCPServerConfig {
   env?: Record<string, string>;
   type?: string;
   url?: string;
+  port?: string;  // Store port for filtering
 }
 
 interface MCPConfig {
@@ -45,6 +45,7 @@ interface IndexerOptions {
   redisPassword?: string;
   embeddingURL: string;
   classifyTools: boolean;
+  targetServer?: string;  // Optional: specific server to index (name or port)
 }
 
 /**
@@ -61,6 +62,7 @@ function parseArgs(): IndexerOptions {
     redisPassword: process.env.REDIS_PASSWORD,
     embeddingURL: process.env.EMBEDDING_URL || 'http://localhost:5000',
     classifyTools: process.env.CLASSIFY_TOOLS !== 'false',  // Default: true
+    targetServer: process.env.TARGET_SERVER,  // Optional: index specific server only
   };
 
   for (let i = 0; i < args.length; i++) {
@@ -91,6 +93,10 @@ function parseArgs(): IndexerOptions {
       case '--classify':
         options.classifyTools = true;
         break;
+      case '--server':
+      case '-s':
+        options.targetServer = args[++i];
+        break;
       case '--help':
       case '-h':
         printHelp();
@@ -111,6 +117,7 @@ Options:
   -c, --config <path>       Path to MCP config file (fallback if gateway unreachable)
   --gateway-url <url>       URL to Agent Gateway config dump (default: http://127.0.0.1:15000/config_dump)
   -f, --force               Force re-indexing even if tools are cached
+  -s, --server <name|port>  Index only a specific server (by name or port)
   --redis-host <host>       Redis host (default: localhost, env: REDIS_HOST)
   --redis-port <port>       Redis port (default: 6380, env: REDIS_PORT)
   --embedding-url <url>     Embedding service URL (default: http://localhost:5000, env: EMBEDDING_URL)
@@ -126,10 +133,13 @@ Environment Variables:
   REDIS_PASSWORD            Redis password
   EMBEDDING_URL             Embedding service URL
   CLASSIFY_TOOLS            Set to 'false' to disable classification
+  TARGET_SERVER             Index only this specific server (name or port)
 
 Examples:
   npm run index                           # Index from gateway
   npm run index -- --force                # Force re-index
+  npm run index -- --server serena        # Index only serena MCP
+  npm run index -- --server 3135          # Index only server on port 3135
   npm run index -- --gateway-url http://... # Custom gateway URL
 `);
 }
@@ -173,7 +183,8 @@ async function discoverServersFromGateway(url: string): Promise<MCPConfig | null
               
               mcpServers[name] = {
                 type: 'sse',
-                url: `http://localhost:${port}/sse`
+                url: `http://localhost:${port}/sse`,
+                port: port,  // Store port for filtering
               };
               console.log(`   Found ${name} on port ${port}`);
             }
@@ -228,6 +239,9 @@ async function main() {
   console.log('═══════════════════════════════════════════════════');
   console.log('         DMCP Indexer - Tool Discovery');
   console.log('═══════════════════════════════════════════════════');
+  if (options.targetServer) {
+    console.log(`         Target: ${options.targetServer}`);
+  }
   console.log('');
 
   // Initialize Redis
@@ -247,9 +261,15 @@ async function main() {
     console.log('   ✓ Redis connected');
     console.log('');
 
-    // Check existing tools
+    // Check existing tools (different behavior based on target server)
     const existingCount = await redis.getToolCount();
-    if (existingCount > 0 && !options.force) {
+    
+    if (options.targetServer) {
+      // When targeting specific server, we do additive indexing (don't clear existing)
+      console.log(`ℹ️  Found ${existingCount} tools already indexed in Redis`);
+      console.log(`   Adding tools from: ${options.targetServer}`);
+      console.log('');
+    } else if (existingCount > 0 && !options.force) {
       console.log(`ℹ️  Found ${existingCount} tools already indexed in Redis`);
       console.log('   Use --force to re-index');
       console.log('');
@@ -257,7 +277,7 @@ async function main() {
       process.exit(0);
     }
 
-    if (options.force && existingCount > 0) {
+    if (options.force && existingCount > 0 && !options.targetServer) {
       console.log(`🗑️  Clearing ${existingCount} existing tools...`);
       await redis.clearIndex();
     }
@@ -276,17 +296,42 @@ async function main() {
       process.exit(1);
     }
 
+    // Filter to target server if specified
+    if (options.targetServer) {
+      const filteredServers: Record<string, MCPServerConfig> = {};
+      for (const [name, serverConfig] of Object.entries(config.mcpServers)) {
+        // Match by name or port
+        if (name === options.targetServer || 
+            name.includes(options.targetServer) ||
+            serverConfig.port === options.targetServer) {
+          filteredServers[name] = serverConfig;
+        }
+      }
+      
+      if (Object.keys(filteredServers).length === 0) {
+        console.error(`❌ No server found matching: ${options.targetServer}`);
+        console.log('   Available servers:');
+        for (const [name, serverConfig] of Object.entries(config.mcpServers)) {
+          console.log(`     • ${name} (port ${serverConfig.port})`);
+        }
+        await redis.disconnect();
+        process.exit(1);
+      }
+      
+      config.mcpServers = filteredServers;
+    }
+
     const serverCount = Object.keys(config.mcpServers).length;
-    console.log(`   Found ${serverCount} MCP servers`);
+    console.log(`   Found ${serverCount} MCP server${serverCount > 1 ? 's' : ''} to index`);
     console.log('');
 
-    // Discover tools from all servers
+    // Discover tools from servers
     console.log('🔍 Discovering tools from MCP servers...');
     console.log('');
     
     const tools: ToolMetadata[] = [];
     const clients: Map<string, Client> = new Map();
-    let toolIdCounter = 0;
+    let toolIdCounter = Date.now();  // Use timestamp to ensure unique IDs for additive indexing
     let successfulServers = 0;
     let failedServers = 0;
 
@@ -426,29 +471,6 @@ async function main() {
       console.log(`   ✓ Classification complete`);
       console.log(`     • meta: ${stats.meta} | query: ${stats.query} | action: ${stats.action} | general: ${stats.general}`);
     }
-    console.log('');
-
-    // ============ KEYWORD EXTRACTION STEP ============
-    console.log('🔑 Extracting keywords from descriptions...');
-    
-    const keywordStartTime = Date.now();
-    let keywordCount = 0;
-    
-    for (const tool of tools) {
-      const extraction = extractKeywords(tool.name, tool.description);
-      tool.keywords = extraction.keywords;
-      keywordCount += extraction.keywords.length;
-      
-      // Enhance description with searchable text for BM25
-      // Append keywords as plain text for better BM25 matching
-      if (extraction.searchableText) {
-        tool.description = `${tool.description} ${extraction.searchableText}`;
-      }
-    }
-    
-    console.log(`   ✓ Keyword extraction complete (${Date.now() - keywordStartTime}ms)`);
-    console.log(`     • Extracted ${keywordCount} keywords from ${tools.length} tools`);
-    console.log(`     • Average: ${(keywordCount / tools.length).toFixed(1)} keywords per tool`);
     console.log('');
 
     // Index tools with progress bar
