@@ -27,6 +27,7 @@ import {
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { SSEClientTransport } from '@modelcontextprotocol/sdk/client/sse.js';
 import { RedisVSS, FilteredTool } from './redis-vss.js';
+import { ToolRouter, RouteResult } from './tool-router.js';
 import { readFileSync } from 'fs';
 import { join } from 'path';
 import { homedir } from 'os';
@@ -61,6 +62,7 @@ function sanitizeToolName(name: string): string {
 class DMCPServer {
   private server: Server;
   private redis: RedisVSS;
+  private toolRouter: ToolRouter;
   
   // Currently exposed tools (dynamic subset)
   private exposedTools: Map<string, Tool> = new Map();
@@ -111,6 +113,9 @@ class DMCPServer {
       password: process.env.REDIS_PASSWORD,
       embeddingDimensions: 384,
     });
+
+    // Initialize router (will load pre-computed clusters from Redis)
+    this.toolRouter = new ToolRouter();
 
     this.setupHandlers();
   }
@@ -352,7 +357,7 @@ class DMCPServer {
   }
 
   /**
-   * Handle the search_tools meta-tool
+   * Handle the search_tools meta-tool with smart routing
    */
   private async handleSearchTools(args: Record<string, unknown>): Promise<{ content: Array<{ type: string; text: string }> }> {
     const query = args.query as string;
@@ -366,14 +371,16 @@ class DMCPServer {
       console.error(`[DMCP] Detected intent: ${intent}`);
     }
 
-    let filteredTools = await this.redis.search(query, {
-      topK: limit,
+    // Get more candidates from Redis for routing
+    const rawTools = await this.redis.search(query, {
+      topK: limit * 3,  // Get more candidates for routing/dedup
       minScore: this.minScore,
     });
 
-    console.error(`[DMCP] Found ${filteredTools.length} tools from Redis`);
+    console.error(`[DMCP] Found ${rawTools.length} candidate tools from Redis`);
 
     // Apply intent filtering if detected
+    let filteredTools = rawTools;
     if (intent && filteredTools.length > 3) {
       const beforeCount = filteredTools.length;
       filteredTools = this.filterByIntent(filteredTools, intent);
@@ -382,17 +389,68 @@ class DMCPServer {
       }
     }
 
-    // Update exposed tools and notify
-    this.updateExposedTools(filteredTools);
+    // Apply smart routing: deduplicate by capability cluster, prioritize by domain
+    const routeResult = this.toolRouter.route(filteredTools, query);
+    
+    if (routeResult.forcedDomain) {
+      console.error(`[DMCP] Forced domain: ${routeResult.forcedDomain}`);
+    }
+    if (routeResult.forcedTenant) {
+      console.error(`[DMCP] Forced tenant: ${routeResult.forcedTenant}`);
+    }
+    if (routeResult.deduplicatedCount > 0) {
+      console.error(`[DMCP] Routed: ${filteredTools.length} → ${routeResult.tools.length} tools (deduplicated ${routeResult.deduplicatedCount})`);
+    }
 
-    // Return formatted results for LLM
-    const toolList = filteredTools.map((t, i) => {
+    // Limit to requested count after routing
+    const finalTools = routeResult.tools.slice(0, limit);
+
+    // Update exposed tools and notify
+    this.updateExposedTools(finalTools);
+
+    // Build alternate servers lookup for display
+    const toolAlternates = new Map<string, string[]>();
+    if (routeResult.alternateServers) {
+      for (const tool of finalTools) {
+        if (tool.clusterId && routeResult.alternateServers.has(tool.clusterId)) {
+          const allServers = routeResult.alternateServers.get(tool.clusterId)!;
+          // Only show alternates (exclude the current server)
+          const alternates = allServers.filter(s => s !== tool.serverId);
+          if (alternates.length > 0) {
+            toolAlternates.set(tool.id, alternates);
+          }
+        }
+      }
+    }
+
+    // Return formatted results for LLM with routing info
+    const toolList = finalTools.map((t, i) => {
       const toolKey = sanitizeToolName(`${t.serverId}_${t.name}`);
-      return `${i + 1}. **${toolKey}** (score: ${t.score.toFixed(2)})\n   ${t.description}`;
+      const domainInfo = t.domain ? ` [${t.domain}]` : '';
+      let entry = `${i + 1}. **${toolKey}**${domainInfo} (score: ${t.score.toFixed(2)})\n   ${t.description}`;
+      
+      // Add alternate servers info if available
+      const alternates = toolAlternates.get(t.id);
+      if (alternates && alternates.length > 0) {
+        entry += `\n   _Also available from: ${alternates.join(', ')}_`;
+      }
+      
+      return entry;
     }).join('\n\n');
 
-    const response = `Found ${filteredTools.length} relevant tools for "${query}":\n\n${toolList}\n\n` +
-      `These tools are now available. You can call them directly by name.`;
+    let response = `Found ${finalTools.length} relevant tools for "${query}":\n\n${toolList}\n\n`;
+    
+    if (routeResult.forcedTenant) {
+      response += `Note: Targeting **${routeResult.forcedTenant}** based on your query.\n`;
+    }
+    if (routeResult.forcedDomain) {
+      response += `Note: Preferring ${routeResult.forcedDomain} tools based on your query.\n`;
+    }
+    if (routeResult.deduplicatedCount > 0) {
+      response += `Deduplicated ${routeResult.deduplicatedCount} similar tools from different servers.\n`;
+    }
+    
+    response += `These tools are now available. You can call them directly by name.`;
 
     return {
       content: [{ type: 'text', text: response }],

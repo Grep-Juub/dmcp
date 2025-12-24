@@ -13,16 +13,27 @@
  * - query: Read-only data retrieval (get, list, search, fetch)
  * - action: State-changing operations (create, update, delete)
  * - general: Everything else
+ * 
+ * Domain classification is handled by tool-router.ts for smart tool selection
  */
 
 import { LocalEmbeddingProvider } from './custom-embedding-provider.js';
+import { DomainClassifier, type ToolDomain, type DomainClassification } from './tool-router.js';
 
 export type ToolCategory = 'meta' | 'query' | 'action' | 'general';
+
+// Re-export domain types for consumers
+export type { ToolDomain, DomainClassification };
 
 export interface ClassificationResult {
   category: ToolCategory;
   confidence: number;
   reasoning?: string;
+}
+
+export interface FullClassificationResult extends ClassificationResult {
+  domain: ToolDomain;
+  domainConfidence: number;
 }
 
 export interface EmbeddingClassifierConfig {
@@ -89,14 +100,19 @@ function cosineSimilarity(a: Float32Array, b: Float32Array): number {
 export class EmbeddingClassifier {
   private embeddingProvider: LocalEmbeddingProvider;
   private categoryEmbeddings: Map<ToolCategory, Float32Array[]> | null = null;
+  private domainClassifier: DomainClassifier;
   private initialized = false;
 
   constructor(config: EmbeddingClassifierConfig = {}) {
+    const embeddingURL = config.embeddingURL || process.env.EMBEDDING_URL || 'http://localhost:5000';
+    
     this.embeddingProvider = new LocalEmbeddingProvider({
       provider: 'local',
-      baseURL: config.embeddingURL || process.env.EMBEDDING_URL || 'http://localhost:5000',
+      baseURL: embeddingURL,
       dimensions: config.embeddingDimensions || 384,
     });
+    
+    this.domainClassifier = new DomainClassifier(embeddingURL);
   }
 
   /**
@@ -269,6 +285,45 @@ export class EmbeddingClassifier {
     }
 
     return stats;
+  }
+
+  /**
+   * Get the domain classifier for domain-based routing
+   */
+  getDomainClassifier(): DomainClassifier {
+    return this.domainClassifier;
+  }
+
+  /**
+   * Classify both category and domain in batch
+   * This is the main method for full tool classification
+   */
+  async classifyFullBatch(
+    tools: Array<{ name: string; description: string; serverId: string }>,
+    onProgress?: (current: number, total: number) => void
+  ): Promise<Map<string, FullClassificationResult>> {
+    // Get category classifications
+    const categoryResults = await this.classifyBatch(
+      tools.map(t => ({ name: t.name, description: t.description })),
+      onProgress
+    );
+    
+    // Get domain classifications
+    const domainResults = await this.domainClassifier.classifyBatch(tools);
+    
+    // Combine results
+    const fullResults = new Map<string, FullClassificationResult>();
+    
+    for (const [name, categoryResult] of categoryResults) {
+      const domainResult = domainResults.get(name) || { domain: 'general' as ToolDomain, confidence: 0 };
+      fullResults.set(name, {
+        ...categoryResult,
+        domain: domainResult.domain,
+        domainConfidence: domainResult.confidence,
+      });
+    }
+    
+    return fullResults;
   }
 }
 

@@ -18,7 +18,8 @@
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { SSEClientTransport } from '@modelcontextprotocol/sdk/client/sse.js';
 import { RedisVSS, ToolMetadata } from './redis-vss.js';
-import { EmbeddingClassifier, classifyToolHeuristic } from './tool-classifier.js';
+import { EmbeddingClassifier, classifyToolHeuristic, type ToolDomain } from './tool-classifier.js';
+import { CapabilityClusterer, formatDomainStats } from './tool-router.js';
 import { readFileSync } from 'fs';
 import { join } from 'path';
 import { homedir } from 'os';
@@ -272,7 +273,7 @@ async function main() {
     }
 
     // ============ CLASSIFICATION STEP ============
-    console.log('🏷️  Classifying tools...');
+    console.log('🏷️  Classifying tools (category + domain)...');
     
     const classificationStartTime = Date.now();
     
@@ -283,8 +284,9 @@ async function main() {
         embeddingURL: options.embeddingURL,
       });
 
-      const classifications = await classifier.classifyBatch(
-        tools.map(t => ({ name: t.name, description: t.description })),
+      // Use full classification (category + domain)
+      const classifications = await classifier.classifyFullBatch(
+        tools.map(t => ({ name: t.name, description: t.description, serverId: t.serverId })),
         (current, total) => {
           const percent = Math.floor((current / total) * 100);
           process.stdout.write(`\r   Classifying: ${percent}% (${current}/${total})     `);
@@ -297,16 +299,49 @@ async function main() {
       for (const tool of tools) {
         const result = classifications.get(tool.name);
         tool.category = result?.category || 'general';
+        tool.domain = result?.domain || 'general';
       }
 
-      const stats = classifier.getStats(classifications);
+      // Category stats
+      const categoryStats = { meta: 0, query: 0, action: 0, general: 0 };
+      for (const tool of tools) {
+        categoryStats[tool.category as keyof typeof categoryStats]++;
+      }
       console.log(`   ✓ Classification complete (${Date.now() - classificationStartTime}ms)`);
-      console.log(`     • meta: ${stats.meta} | query: ${stats.query} | action: ${stats.action} | general: ${stats.general}`);
+      console.log(`     Categories: meta: ${categoryStats.meta} | query: ${categoryStats.query} | action: ${categoryStats.action} | general: ${categoryStats.general}`);
+      
+      // Domain stats
+      const domainStats: Record<ToolDomain, number> = {
+        api: 0, terminal: 0, browser: 0, reasoning: 0, 
+        filesystem: 0, data: 0, observability: 0, cloud: 0, general: 0
+      };
+      for (const tool of tools) {
+        if (tool.domain) {
+          domainStats[tool.domain as ToolDomain]++;
+        }
+      }
+      console.log(`     Domains: ${formatDomainStats(domainStats)}`);
+      
+      // ============ CAPABILITY CLUSTERING STEP ============
+      console.log('');
+      console.log('🔗 Clustering similar tools...');
+      
+      const clusterer = new CapabilityClusterer(classifier.getDomainClassifier().getEmbeddingProvider());
+      const clusters = await clusterer.clusterTools(
+        tools.map(t => ({ name: t.name, description: t.description }))
+      );
+      
+      // Apply cluster IDs to tools
+      for (const tool of tools) {
+        tool.clusterId = clusters.get(tool.name);
+      }
+      
     } else {
       console.log('   Using heuristic classification (--no-classify)');
       
       for (const tool of tools) {
         tool.category = classifyToolHeuristic(tool.name, tool.description);
+        tool.domain = 'general';  // Default domain when using heuristics
       }
 
       // Count categories

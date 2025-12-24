@@ -22,6 +22,8 @@ export interface ToolMetadata {
   description: string;
   inputSchema?: any;
   category?: string;
+  domain?: string;      // Tool domain for smart routing (api, terminal, browser, etc.)
+  clusterId?: string;   // Capability cluster ID for deduplication
   keywords?: string[];
 }
 
@@ -163,6 +165,14 @@ export class RedisVSS {
           '$.category': {
             type: 'TAG' as any,
             AS: 'category'
+          },
+          '$.domain': {
+            type: 'TAG' as any,
+            AS: 'domain'
+          },
+          '$.clusterId': {
+            type: 'TAG' as any,
+            AS: 'clusterId'
           },
           '$.vector': {
             type: 'VECTOR' as any,
@@ -318,7 +328,7 @@ export class RedisVSS {
         this.indexName,
         textQuery,
         {
-          RETURN: ['serverId', 'name', 'description', 'category', 'inputSchema'],
+          RETURN: ['serverId', 'name', 'description', 'category', 'inputSchema', 'domain', 'clusterId'],
           LIMIT: { from: 0, size: topK }
         }
       );
@@ -335,6 +345,8 @@ export class RedisVSS {
             name: doc.value.name as string,
             description: doc.value.description as string,
             category: doc.value.category as string,
+            domain: doc.value.domain as string | undefined,
+            clusterId: doc.value.clusterId as string | undefined,
             inputSchema: doc.value.inputSchema,
             score: 0.9  // Text matches get high score
           });
@@ -375,7 +387,7 @@ export class RedisVSS {
         this.indexName,
         `${searchQuery}=>[KNN ${remainingSlots * 2} @vector $query_vector AS __vector_score]`,
         {
-          RETURN: ['serverId', 'name', 'description', 'category', 'inputSchema', '__vector_score'],
+          RETURN: ['serverId', 'name', 'description', 'category', 'inputSchema', 'domain', 'clusterId', '__vector_score'],
           SORTBY: {
             BY: '__vector_score',
             DIRECTION: 'ASC'
@@ -418,6 +430,8 @@ export class RedisVSS {
           name: doc.value.name as string,
           description: doc.value.description as string,
           category: doc.value.category as string,
+          domain: doc.value.domain as string | undefined,
+          clusterId: doc.value.clusterId as string | undefined,
           inputSchema: doc.value.inputSchema,
           score
         });
