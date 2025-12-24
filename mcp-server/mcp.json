@@ -1,0 +1,112 @@
+{
+  "mcpServers": {
+    "sequential-thinking": {
+      "type": "sse",
+      "url": "http://localhost:3101/sse"
+    },
+    "filesystem": {
+      "type": "sse",
+      "url": "http://localhost:3121/sse"
+    },
+    "memory": {
+      "type": "sse",
+      "url": "http://localhost:3122/sse"
+    },
+    "github": {
+      "type": "sse",
+      "url": "http://localhost:3103/sse"
+    },
+    "atlassian": {
+      "type": "sse",
+      "url": "http://localhost:3104/sse"
+    },
+    "jira-tempo": {
+      "type": "sse",
+      "url": "http://localhost:3105/sse"
+    },
+    "google-workspace": {
+      "type": "sse",
+      "url": "http://localhost:3102/sse"
+    },
+    "aws-api": {
+      "type": "sse",
+      "url": "http://localhost:3110/sse"
+    },
+    "aws-pricing": {
+      "type": "sse",
+      "url": "http://localhost:3111/sse"
+    },
+    "cost-explorer": {
+      "type": "sse",
+      "url": "http://localhost:3112/sse"
+    },
+    "cloudtrail": {
+      "type": "sse",
+      "url": "http://localhost:3113/sse"
+    },
+    "billing-cost-management": {
+      "type": "sse",
+      "url": "http://localhost:3114/sse"
+    },
+    "ccapi-ew1": {
+      "type": "sse",
+      "url": "http://localhost:3108/sse"
+    },
+    "ccapi-usw1": {
+      "type": "sse",
+      "url": "http://localhost:3109/sse"
+    },
+    "grafana": {
+      "type": "sse",
+      "url": "http://localhost:3107/sse"
+    },
+    "datadog-heap": {
+      "type": "sse",
+      "url": "http://localhost:3117/sse"
+    },
+    "datadog-hotjar": {
+      "type": "sse",
+      "url": "http://localhost:3118/sse"
+    },
+    "datadog-contentsquare": {
+      "type": "sse",
+      "url": "http://localhost:3119/sse"
+    },
+    "context7": {
+      "type": "sse",
+      "url": "http://localhost:3130/sse"
+    },
+    "desktop-commander": {
+      "type": "sse",
+      "url": "http://localhost:3131/sse"
+    },
+    "wcgw": {
+      "type": "sse",
+      "url": "http://localhost:3132/sse"
+    },
+    "playwright": {
+      "type": "sse",
+      "url": "http://localhost:3133/sse"
+    },
+    "tavily": {
+      "type": "sse",
+      "url": "http://localhost:3134/sse"
+    },
+    "steampipe": {
+      "type": "sse",
+      "url": "http://localhost:3106/sse"
+    },
+    "azure": {
+      "type": "sse",
+      "url": "http://localhost:3115/sse"
+    },
+    "postgres": {
+      "type": "sse",
+      "url": "http://localhost:3116/sse"
+    },
+    "kubernetes": {
+      "type": "sse",
+      "url": "http://localhost:3120/sse"
+    }
+  }
+}

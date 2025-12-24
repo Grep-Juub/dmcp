@@ -12,8 +12,8 @@
     "build": "tsc",
     "index": "REDIS_PORT=6380 tsx src/dmcp-indexer.ts",
     "index:force": "REDIS_PORT=6380 tsx src/dmcp-indexer.ts --force",
-    "start": "REDIS_PORT=6380 tsx src/dmcp-server.ts ../one-mcp/mcp.json",
-    "start:prod": "npm run build && REDIS_PORT=6380 node dist/dmcp-server.js ../one-mcp/mcp.json"
+    "start": "REDIS_PORT=6380 tsx src/dmcp-server.ts",
+    "start:prod": "npm run build && REDIS_PORT=6380 node dist/dmcp-server.js"
   },
   "keywords": [
     "mcp",
@@ -30,6 +30,7 @@
     "@modelcontextprotocol/sdk": "^1.24.3",
     "@portkey-ai/mcp-tool-filter": "^1.0.1",
     "eventsource": "^4.1.0",
+    "natural": "^8.1.0",
     "node-fetch": "^3.3.2",
     "redis": "^5.10.0"
   },

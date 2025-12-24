@@ -14,10 +14,12 @@
 import { createClient } from 'redis';
 import type { RedisClientType } from 'redis';
 import { LocalEmbeddingProvider } from './custom-embedding-provider.js';
+import { HybridSearchEngine } from './hybrid-search.js';
 
 export interface ToolMetadata {
   id: string;
   serverId: string;
+  serverUrl?: string;   // Direct connection URL for the server hosting this tool
   name: string;
   description: string;
   inputSchema?: any;
@@ -49,6 +51,7 @@ export interface RedisVSSConfig {
 export class RedisVSS {
   private client: RedisClientType;
   private embeddingProvider: LocalEmbeddingProvider;
+  private hybridSearch: HybridSearchEngine;
   private indexName: string;
   private dimensions: number;
   private isConnected: boolean = false;
@@ -91,6 +94,12 @@ export class RedisVSS {
       provider: 'local',
       baseURL: embeddingURL,
       dimensions: embeddingDimensions,
+    });
+
+    // Initialize hybrid search engine
+    this.hybridSearch = new HybridSearchEngine({
+      bm25Weight: 0.3,    // 30% weight for BM25 (keyword matching)
+      vectorWeight: 0.7,  // 70% weight for vector (semantic matching)
     });
 
     // Suppress repeated error logs (they're expected during reconnect)
@@ -153,6 +162,10 @@ export class RedisVSS {
           '$.serverId': {
             type: 'TAG' as any,
             AS: 'serverId'
+          },
+          '$.serverUrl': {
+            type: 'TAG' as any,
+            AS: 'serverUrl'
           },
           '$.name': {
             type: 'TEXT' as any,
@@ -268,23 +281,42 @@ export class RedisVSS {
 
     const duration = Date.now() - startTime;
     console.error(`[RedisVSS] ✓ Indexed ${tools.length} tools in ${duration}ms (${(duration / tools.length).toFixed(1)}ms per tool)`);
+    
+    // Build BM25 index for hybrid search
+    await this.buildBM25Index(tools);
+  }
+
+  /**
+   * Build BM25 index from tools for hybrid search
+   */
+  private async buildBM25Index(tools: ToolMetadata[]): Promise<void> {
+    console.error('[RedisVSS] Building BM25 index for hybrid search...');
+    
+    const documents = tools.map(tool => ({
+      id: `${tool.serverId}:${tool.name}`,
+      text: `${tool.name} ${tool.description}`,
+    }));
+
+    this.hybridSearch.indexDocuments(documents);
   }
 
   /**
    * Search for tools semantically similar to the query
    * 
-   * HYBRID SEARCH STRATEGY:
-   * 1. First try text search (FT.SEARCH) for exact keyword matches
-   * 2. Then use vector search for semantic understanding
-   * 3. Combine and deduplicate results
+   * ENHANCED HYBRID SEARCH STRATEGY (ToolLLM-inspired):
+   * 1. Text search (FT.SEARCH) for exact keyword matches
+   * 2. BM25 search for statistical relevance
+   * 3. Vector search for semantic understanding
+   * 4. Score fusion to combine all approaches
    * 
-   * This gives us the best of both worlds:
-   * - Fast exact matches for "jira issue", "kubernetes pods"
-   * - Semantic matches for "ticket management", "cloud costs"
+   * This gives us the best of all worlds:
+   * - Fast exact matches: "jira issue", "kubernetes pods"
+   * - Statistical relevance: BM25 ranking
+   * - Semantic matches: "ticket management", "cloud costs"
    * 
    * @param query - User query or context
    * @param options - Search options
-   * @returns Filtered tools with similarity scores
+   * @returns Filtered tools with fused similarity scores
    */
   async search(
     query: string,
@@ -303,10 +335,9 @@ export class RedisVSS {
     } = options;
 
     const startTime = Date.now();
-    const seenTools = new Set<string>();
-    const tools: FilteredTool[] = [];
+    const toolScores = new Map<string, { tool: FilteredTool; bm25Score: number; vectorScore: number }>();
 
-    // Build filter for both search methods
+    // Build filter for vector/text search
     const filters: string[] = [];
     if (serverIds && serverIds.length > 0) {
       filters.push(`@serverId:{${serverIds.join('|')}}`);
@@ -315,62 +346,25 @@ export class RedisVSS {
       filters.push(`@category:{${categories.join('|')}}`);
     }
 
-    // ============ PHASE 1: TEXT SEARCH ============
-    // Fast exact matches - "jira" finds jira_get, jira_post, etc.
-    try {
-      const textQuery = filters.length > 0 
-        ? `${filters.join(' ')} ${query}`
-        : query;
-      
-      console.error(`[RedisVSS] Phase 1 - Text search: "${textQuery}"`);
-      
-      const textResults = await this.client.ft.search(
-        this.indexName,
-        textQuery,
-        {
-          RETURN: ['serverId', 'name', 'description', 'category', 'inputSchema', 'domain', 'clusterId'],
-          LIMIT: { from: 0, size: topK }
-        }
-      );
-
-      console.error(`[RedisVSS] Text search found ${textResults.total} matches`);
-
-      for (const doc of textResults.documents) {
-        const toolKey = `${doc.value.serverId}:${doc.value.name}`;
-        if (!seenTools.has(toolKey)) {
-          seenTools.add(toolKey);
-          tools.push({
-            id: doc.id.split(':')[2],
-            serverId: doc.value.serverId as string,
-            name: doc.value.name as string,
-            description: doc.value.description as string,
-            category: doc.value.category as string,
-            domain: doc.value.domain as string | undefined,
-            clusterId: doc.value.clusterId as string | undefined,
-            inputSchema: doc.value.inputSchema,
-            score: 0.9  // Text matches get high score
-          });
-        }
-      }
-    } catch (textError) {
-      // Text search may fail on complex queries - that's OK
-      console.error(`[RedisVSS] Text search skipped: ${(textError as Error).message}`);
-    }
-
-    // If text search found enough results, we're done
-    if (tools.length >= topK) {
-      const duration = Date.now() - startTime;
-      console.error(`[RedisVSS] Found ${tools.length} tools via text search in ${duration}ms`);
-      return tools.slice(0, topK);
+    // ============ PHASE 1: BM25 SEARCH ============
+    console.error(`[RedisVSS] Phase 1 - BM25 search: "${query}"`);
+    const bm25Results = this.hybridSearch.searchBM25(query, topK * 2);
+    console.error(`[RedisVSS] BM25 found ${bm25Results.length} results`);
+    
+    // Store BM25 scores
+    for (const result of bm25Results) {
+      const [serverId, name] = result.id.split(':');
+      const toolKey = result.id;
+      toolScores.set(toolKey, {
+        tool: null as any, // Will populate from Redis
+        bm25Score: result.score,
+        vectorScore: 0,
+      });
     }
 
     // ============ PHASE 2: VECTOR SEARCH ============
-    // Semantic matches - "ticket management" finds jira tools
-    const remainingSlots = topK - tools.length;
-    
-    // Generate query embedding with "query" prefix for E5 model
     const queryEmbedding = await this.embeddingProvider.embed(query, 'query');
-    console.error(`[RedisVSS] Phase 2 - Vector search, query embedding length: ${queryEmbedding.length}`);
+    console.error(`[RedisVSS] Phase 2 - Vector search`);
     const vectorBytes = Buffer.from(queryEmbedding.buffer);
 
     let searchQuery = '*';
@@ -378,16 +372,13 @@ export class RedisVSS {
       searchQuery = filters.join(' ');
     }
 
-    console.error(`[RedisVSS] Vector search: ${searchQuery}=>[KNN ${remainingSlots * 2} @vector $query_vector]`);
-
-    // Perform vector similarity search
     let results;
     try {
       results = await this.client.ft.search(
         this.indexName,
-        `${searchQuery}=>[KNN ${remainingSlots * 2} @vector $query_vector AS __vector_score]`,
+        `${searchQuery}=>[KNN ${topK * 2} @vector $query_vector AS __vector_score]`,
         {
-          RETURN: ['serverId', 'name', 'description', 'category', 'inputSchema', 'domain', 'clusterId', '__vector_score'],
+          RETURN: ['serverId', 'name', 'description', 'category', 'inputSchema', 'domain', 'clusterId', 'serverUrl', '__vector_score'],
           SORTBY: {
             BY: '__vector_score',
             DIRECTION: 'ASC'
@@ -398,7 +389,7 @@ export class RedisVSS {
           },
           LIMIT: {
             from: 0,
-            size: remainingSlots * 2 // Get more than needed to filter by score
+            size: topK * 2
           }
         } as any
       );
@@ -407,47 +398,72 @@ export class RedisVSS {
       throw error;
     }
 
-    console.error(`[RedisVSS] Vector search returned ${results.total} total, ${results.documents.length} documents`);
+    console.error(`[RedisVSS] Vector search returned ${results.documents.length} documents`);
 
-    // Parse and add vector results (avoiding duplicates from text search)
+    // Process vector results
     for (const doc of results.documents) {
       const toolKey = `${doc.value.serverId}:${doc.value.name}`;
-      
-      // Skip if already found in text search
-      if (seenTools.has(toolKey)) continue;
-      
-      // Redis returns 1 - cosine_distance as score (higher is better)
       const vectorScore: any = doc.value['__vector_score'];
       const score = 1 - parseFloat(typeof vectorScore === 'string' ? vectorScore : String(vectorScore || '1'));
       
-      console.error(`[RedisVSS] Doc ${doc.id}: score=${score.toFixed(3)}, name=${doc.value.name}`);
-      
-      if (score >= minScore) {
-        seenTools.add(toolKey);
-        tools.push({
-          id: doc.id.split(':')[2],
-          serverId: doc.value.serverId as string,
-          name: doc.value.name as string,
-          description: doc.value.description as string,
-          category: doc.value.category as string,
-          domain: doc.value.domain as string | undefined,
-          clusterId: doc.value.clusterId as string | undefined,
-          inputSchema: doc.value.inputSchema,
-          score
+      const tool: FilteredTool = {
+        id: doc.id.split(':')[2],
+        serverId: doc.value.serverId as string,
+        serverUrl: doc.value.serverUrl as string,
+        name: doc.value.name as string,
+        description: doc.value.description as string,
+        category: doc.value.category as string,
+        domain: doc.value.domain as string | undefined,
+        clusterId: doc.value.clusterId as string | undefined,
+        inputSchema: doc.value.inputSchema,
+        score: score
+      };
+
+      const existing = toolScores.get(toolKey);
+      if (existing) {
+        existing.tool = tool;
+        existing.vectorScore = score;
+      } else {
+        toolScores.set(toolKey, {
+          tool,
+          bm25Score: 0,
+          vectorScore: score,
         });
       }
-
-      if (tools.length >= topK) break;
     }
+
+    // ============ PHASE 3: SCORE FUSION ============
+    console.error(`[RedisVSS] Phase 3 - Fusing scores from BM25 and vector search`);
+    
+    const config = this.hybridSearch.getConfig();
+    const fusedResults: FilteredTool[] = [];
+
+    for (const [toolKey, { tool, bm25Score, vectorScore }] of toolScores) {
+      if (!tool) continue; // BM25 hit but not in Redis vector results
+      
+      // Weighted fusion
+      const fusedScore = config.bm25Weight * bm25Score + config.vectorWeight * vectorScore;
+      
+      if (fusedScore >= minScore) {
+        fusedResults.push({
+          ...tool,
+          score: fusedScore,
+        });
+      }
+    }
+
+    // Sort by fused score
+    fusedResults.sort((a, b) => b.score - a.score);
+    const finalResults = fusedResults.slice(0, topK);
 
     const duration = Date.now() - startTime;
-    console.error(`[RedisVSS] Found ${tools.length} relevant tools in ${duration}ms (hybrid search)`);
+    console.error(`[RedisVSS] Found ${finalResults.length} relevant tools in ${duration}ms (hybrid: BM25 + vector)`);
     
-    if (tools.length > 0) {
-      console.error(`[RedisVSS] Top tool: ${tools[0].name} (score: ${tools[0].score.toFixed(3)})`);
+    if (finalResults.length > 0) {
+      console.error(`[RedisVSS] Top tool: ${finalResults[0].name} (score: ${finalResults[0].score.toFixed(3)})`);
     }
 
-    return tools.slice(0, topK);
+    return finalResults;
   }
 
   /**
@@ -501,7 +517,7 @@ export class RedisVSS {
         this.indexName,
         `@category:{${category}}`,
         {
-          RETURN: ['serverId', 'name', 'description', 'category', 'inputSchema'],
+          RETURN: ['serverId', 'name', 'description', 'category', 'inputSchema', 'serverUrl'],
           LIMIT: { from: 0, size: 100 }  // Assume < 100 meta tools
         }
       );
@@ -510,6 +526,7 @@ export class RedisVSS {
         tools.push({
           id: doc.id.split(':')[2],
           serverId: doc.value.serverId as string,
+          serverUrl: doc.value.serverUrl as string,
           name: doc.value.name as string,
           description: doc.value.description as string,
           category: doc.value.category as string,
@@ -521,6 +538,46 @@ export class RedisVSS {
       console.error(`[RedisVSS] Found ${tools.length} tools with category '${category}'`);
     } catch (error) {
       console.error(`[RedisVSS] Error fetching ${category} tools:`, (error as Error).message);
+    }
+
+    return tools;
+  }
+
+  /**
+   * Get all tools from Redis (for quality auditing and analysis)
+   */
+  async getAllTools(): Promise<ToolMetadata[]> {
+    const tools: ToolMetadata[] = [];
+
+    try {
+      // Search with wildcard to get all tools
+      const results = await this.client.ft.search(
+        this.indexName,
+        '*',
+        {
+          RETURN: ['serverId', 'name', 'description', 'category', 'inputSchema', 'domain', 'clusterId', 'serverUrl', 'keywords'],
+          LIMIT: { from: 0, size: 10000 }  // Adjust if you have more tools
+        }
+      );
+
+      for (const doc of results.documents) {
+        tools.push({
+          id: doc.id.split(':')[2],
+          serverId: doc.value.serverId as string,
+          serverUrl: doc.value.serverUrl as string,
+          name: doc.value.name as string,
+          description: doc.value.description as string,
+          category: doc.value.category as string,
+          domain: doc.value.domain as string | undefined,
+          clusterId: doc.value.clusterId as string | undefined,
+          inputSchema: doc.value.inputSchema,
+          keywords: doc.value.keywords ? JSON.parse(doc.value.keywords as string) : undefined,
+        });
+      }
+
+      console.error(`[RedisVSS] Retrieved ${tools.length} total tools`);
+    } catch (error) {
+      console.error(`[RedisVSS] Error fetching all tools:`, (error as Error).message);
     }
 
     return tools;

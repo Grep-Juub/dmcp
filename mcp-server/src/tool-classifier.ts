@@ -19,6 +19,7 @@
 
 import { LocalEmbeddingProvider } from './custom-embedding-provider.js';
 import { DomainClassifier, type ToolDomain, type DomainClassification } from './tool-router.js';
+import { cosineSimilarity } from './utils.js';
 
 export type ToolCategory = 'meta' | 'query' | 'action' | 'general';
 
@@ -77,23 +78,6 @@ const CATEGORY_ANCHORS: Record<ToolCategory, string[]> = {
 };
 
 /**
- * Compute cosine similarity between two vectors
- */
-function cosineSimilarity(a: Float32Array, b: Float32Array): number {
-  let dotProduct = 0;
-  let normA = 0;
-  let normB = 0;
-  
-  for (let i = 0; i < a.length; i++) {
-    dotProduct += a[i] * b[i];
-    normA += a[i] * a[i];
-    normB += b[i] * b[i];
-  }
-  
-  return dotProduct / (Math.sqrt(normA) * Math.sqrt(normB));
-}
-
-/**
  * Embedding-based tool classifier using local model
  * Uses zero-shot classification via cosine similarity to category anchors
  */
@@ -109,7 +93,7 @@ export class EmbeddingClassifier {
     this.embeddingProvider = new LocalEmbeddingProvider({
       provider: 'local',
       baseURL: embeddingURL,
-      dimensions: config.embeddingDimensions || 384,
+      dimensions: config.embeddingDimensions || 1024,  // ToolRet-trained-e5-large-v2
     });
     
     this.domainClassifier = new DomainClassifier(embeddingURL);
@@ -209,7 +193,9 @@ export class EmbeddingClassifier {
     const toolTexts = tools.map(t => `${t.name}: ${t.description.slice(0, 500)}`);
     
     console.error(`[Classifier] Embedding ${tools.length} tools...`);
+    process.stdout.write(`   Embedding tools: 0% (0/${tools.length})     `);
     const toolEmbeddings = await this.embeddingProvider.embedBatch(toolTexts, 'passage');
+    process.stdout.write(`\r   Embedding tools: 100% (${tools.length}/${tools.length})   \n`);
     
     // Classify each tool
     for (let i = 0; i < tools.length; i++) {

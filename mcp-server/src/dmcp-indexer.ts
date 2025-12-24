@@ -20,9 +20,9 @@ import { SSEClientTransport } from '@modelcontextprotocol/sdk/client/sse.js';
 import { RedisVSS, ToolMetadata } from './redis-vss.js';
 import { EmbeddingClassifier, classifyToolHeuristic, type ToolDomain } from './tool-classifier.js';
 import { CapabilityClusterer, formatDomainStats } from './tool-router.js';
+import { extractKeywords } from './keyword-extractor.js';
 import { readFileSync } from 'fs';
 import { join } from 'path';
-import { homedir } from 'os';
 
 interface MCPServerConfig {
   command?: string;
@@ -38,6 +38,7 @@ interface MCPConfig {
 
 interface IndexerOptions {
   configPath: string;
+  gatewayUrl: string;
   force: boolean;
   redisHost: string;
   redisPort: number;
@@ -52,7 +53,8 @@ interface IndexerOptions {
 function parseArgs(): IndexerOptions {
   const args = process.argv.slice(2);
   const options: IndexerOptions = {
-    configPath: process.env.MCP_CONFIG_PATH || join(homedir(), 'Work/mcp/mcp-tools/one-mcp/mcp.json'),
+    configPath: process.env.MCP_CONFIG_PATH || join(process.cwd(), 'mcp.json'),
+    gatewayUrl: process.env.MCP_GATEWAY_URL || 'http://127.0.0.1:15000/config_dump',
     force: false,
     redisHost: process.env.REDIS_HOST || 'localhost',
     redisPort: parseInt(process.env.REDIS_PORT || '6380'),
@@ -70,6 +72,9 @@ function parseArgs(): IndexerOptions {
       case '--config':
       case '-c':
         options.configPath = args[++i];
+        break;
+      case '--gateway-url':
+        options.gatewayUrl = args[++i];
         break;
       case '--redis-host':
         options.redisHost = args[++i];
@@ -103,7 +108,8 @@ DMCP Indexer - Index MCP tools in Redis for semantic search
 Usage: dmcp-indexer [options]
 
 Options:
-  -c, --config <path>       Path to MCP config file (default: ~/Work/mcp/mcp-tools/one-mcp/mcp.json)
+  -c, --config <path>       Path to MCP config file (fallback if gateway unreachable)
+  --gateway-url <url>       URL to Agent Gateway config dump (default: http://127.0.0.1:15000/config_dump)
   -f, --force               Force re-indexing even if tools are cached
   --redis-host <host>       Redis host (default: localhost, env: REDIS_HOST)
   --redis-port <port>       Redis port (default: 6380, env: REDIS_PORT)
@@ -114,6 +120,7 @@ Options:
 
 Environment Variables:
   MCP_CONFIG_PATH           Default config file path
+  MCP_GATEWAY_URL           Agent Gateway URL
   REDIS_HOST                Redis host
   REDIS_PORT                Redis port
   REDIS_PASSWORD            Redis password
@@ -121,10 +128,9 @@ Environment Variables:
   CLASSIFY_TOOLS            Set to 'false' to disable classification
 
 Examples:
-  npm run index                           # Index with defaults
+  npm run index                           # Index from gateway
   npm run index -- --force                # Force re-index
-  npm run index -- -c /path/to/mcp.json   # Custom config
-  npm run index -- --no-classify          # Skip embedding classification
+  npm run index -- --gateway-url http://... # Custom gateway URL
 `);
 }
 
@@ -136,6 +142,60 @@ function loadMCPConfig(configPath: string): MCPConfig {
   const content = readFileSync(configPath, 'utf-8');
   return JSON.parse(content);
 }
+
+/**
+ * Discover MCP servers from Agent Gateway
+ */
+async function discoverServersFromGateway(url: string): Promise<MCPConfig | null> {
+  try {
+    console.log(`🌐 Discovering servers from gateway: ${url}`);
+    const response = await fetch(url);
+    if (!response.ok) {
+      throw new Error(`Gateway returned ${response.status} ${response.statusText}`);
+    }
+    
+    const data = await response.json() as any;
+    const mcpServers: Record<string, MCPServerConfig> = {};
+    
+    if (data.binds && Array.isArray(data.binds)) {
+      for (const bind of data.binds) {
+        // Extract port from address (e.g., "[::]:3101" -> 3101)
+        const addressParts = bind.address.split(':');
+        const port = addressParts[addressParts.length - 1];
+        
+        // Extract name from listeners
+        if (bind.listeners) {
+          for (const listenerKey in bind.listeners) {
+            const listener = bind.listeners[listenerKey];
+            if (listener.name) {
+              // Remove 'listener-' prefix if present
+              const name = listener.name.replace(/^listener-/, '');
+              
+              mcpServers[name] = {
+                type: 'sse',
+                url: `http://localhost:${port}/sse`
+              };
+              console.log(`   Found ${name} on port ${port}`);
+            }
+          }
+        }
+      }
+    }
+    
+    const count = Object.keys(mcpServers).length;
+    if (count > 0) {
+      console.log(`✓ Discovered ${count} servers from gateway`);
+      return { mcpServers };
+    } else {
+      console.log('⚠️  No servers found in gateway config');
+      return null;
+    }
+  } catch (error) {
+    console.log(`⚠️  Failed to discover from gateway: ${(error as Error).message}`);
+    return null;
+  }
+}
+
 
 /**
  * Connect to an SSE MCP Server
@@ -176,7 +236,7 @@ async function main() {
     port: options.redisPort,
     password: options.redisPassword,
     embeddingURL: options.embeddingURL,
-    embeddingDimensions: 384,
+    embeddingDimensions: 1024,  // ToolRet-trained-e5-large-v2 uses 1024 dims
   });
 
   try {
@@ -203,7 +263,19 @@ async function main() {
     }
 
     // Load config
-    const config = loadMCPConfig(options.configPath);
+    let config: MCPConfig | null = null;
+    
+    // Try gateway first
+    if (options.gatewayUrl) {
+      config = await discoverServersFromGateway(options.gatewayUrl);
+    }
+    
+    if (!config) {
+      console.error('❌ No MCP configuration found from gateway');
+      await redis.disconnect();
+      process.exit(1);
+    }
+
     const serverCount = Object.keys(config.mcpServers).length;
     console.log(`   Found ${serverCount} MCP servers`);
     console.log('');
@@ -241,6 +313,7 @@ async function main() {
           tools.push({
             id: `${toolIdCounter++}`,
             serverId,
+            serverUrl: serverConfig.url,
             name: tool.name,
             description: tool.description || '',
             inputSchema: tool.inputSchema,
@@ -353,6 +426,29 @@ async function main() {
       console.log(`   ✓ Classification complete`);
       console.log(`     • meta: ${stats.meta} | query: ${stats.query} | action: ${stats.action} | general: ${stats.general}`);
     }
+    console.log('');
+
+    // ============ KEYWORD EXTRACTION STEP ============
+    console.log('🔑 Extracting keywords from descriptions...');
+    
+    const keywordStartTime = Date.now();
+    let keywordCount = 0;
+    
+    for (const tool of tools) {
+      const extraction = extractKeywords(tool.name, tool.description);
+      tool.keywords = extraction.keywords;
+      keywordCount += extraction.keywords.length;
+      
+      // Enhance description with searchable text for BM25
+      // Append keywords as plain text for better BM25 matching
+      if (extraction.searchableText) {
+        tool.description = `${tool.description} ${extraction.searchableText}`;
+      }
+    }
+    
+    console.log(`   ✓ Keyword extraction complete (${Date.now() - keywordStartTime}ms)`);
+    console.log(`     • Extracted ${keywordCount} keywords from ${tools.length} tools`);
+    console.log(`     • Average: ${(keywordCount / tools.length).toFixed(1)} keywords per tool`);
     console.log('');
 
     // Index tools with progress bar

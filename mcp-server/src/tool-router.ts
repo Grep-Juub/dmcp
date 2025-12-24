@@ -17,6 +17,7 @@
  */
 
 import { LocalEmbeddingProvider } from './custom-embedding-provider.js';
+import { cosineSimilarity } from './utils.js';
 
 // ============================================================================
 // Types
@@ -192,23 +193,6 @@ export const CONTEXT_PATTERNS: Array<{ pattern: RegExp; domain: ToolDomain; sign
 // Utility Functions
 // ============================================================================
 
-/**
- * Cosine similarity between two vectors
- */
-function cosineSimilarity(a: Float32Array, b: Float32Array): number {
-  let dotProduct = 0;
-  let normA = 0;
-  let normB = 0;
-  
-  for (let i = 0; i < a.length; i++) {
-    dotProduct += a[i] * b[i];
-    normA += a[i] * a[i];
-    normB += b[i] * b[i];
-  }
-  
-  return dotProduct / (Math.sqrt(normA) * Math.sqrt(normB));
-}
-
 // ============================================================================
 // Domain Classifier - PURELY DESCRIPTION-BASED
 // ============================================================================
@@ -227,7 +211,7 @@ export class DomainClassifier {
     this.embeddingProvider = new LocalEmbeddingProvider({
       provider: 'local',
       baseURL: embeddingURL || process.env.EMBEDDING_URL || 'http://localhost:5000',
-      dimensions: 384,
+      dimensions: 1024,  // ToolRet-trained-e5-large-v2
     });
   }
 

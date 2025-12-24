@@ -9,6 +9,27 @@ This project was inspired by:
 - 📺 **[MCP Tool Overload Problem](https://www.youtube.com/watch?v=hJY04dV-o7U)** - YouTube video explaining the challenge
 - 📝 **[From Reasoning to Retrieval: Solving the MCP Tool Overload Problem](https://redis.io/blog/from-reasoning-to-retrieval-solving-the-mcp-tool-overload-problem/)** - Redis blog post with the vector search solution
 
+## 🔬 Research Foundation
+
+Implementation based on **ToolRet: Toolbox Retrieval for Large Language Models**:
+
+- 📄 **Paper**: [ACL 2025 Findings](https://aclanthology.org/2025.findings-acl.1258.pdf)
+- 🎯 **Key Insight**: Tool-specific contrastive learning significantly improves LLM tool selection
+- 🤗 **Model**: [`mangopy/ToolRet-trained-e5-large-v2`](https://huggingface.co/mangopy/ToolRet-trained-e5-large-v2) (1024 dimensions)
+- ⚡ **Performance**: Superior retrieval accuracy compared to general-purpose embeddings
+- 🏗️ **Architecture**: E5-large-v2 base, fine-tuned on tool-query pairs with contrastive learning
+
+**Citation**:
+```bibtex
+@inproceedings{li2025toolret,
+  title={ToolRet: Toolbox Retrieval for Large Language Models},
+  author={Li, Ziang and Chen, Zhiyu and others},
+  booktitle={Findings of the Association for Computational Linguistics: ACL 2025},
+  year={2025},
+  url={https://aclanthology.org/2025.findings-acl.1258}
+}
+```
+
 ## 🎯 The Problem
 
 When you aggregate 20+ MCP servers (~300+ tools):
@@ -78,13 +99,13 @@ LLM calls: github_create_issue(...)
              │ Generate embeddings                │  • PostgreSQL              │
              │                                    │  • And more...             │
 ┌────────────────────────┐                        └────────────────────────────┘
-│  Embedding Service     │                                     ▲
+│  Infinity Embedding    │                                     ▲
 │  Port: 5000            │                                     │
 │                        │                                     │
-│  • E5-small-v2 model   │      ┌──────────────────────────────┘
-│  • 384 dimensions      │      │
-│  • ONNX Runtime        │      │ Index tools at startup
-│  • ~33s for 318 tools  │      │
+│  • Tool-optimized      │      ┌──────────────────────────────┘
+│  • ToolRet e5-large-v2 │      │
+│  • 1024 dimensions     │      │ Index tools at startup
+│  • OpenAI-compatible   │      │
 └────────────────────────┘      │
              ▲                  │
              │                  │
@@ -103,29 +124,26 @@ LLM calls: github_create_issue(...)
 
 ```
 dmcp/
-├── docker-compose.yml        # Infrastructure (Redis VSS + Embedding)
-├── Dockerfile                # ONNX-optimized embedding service
-├── app.py                    # Flask embedding API (E5-small-v2)
-├── requirements.txt          # Python dependencies
+├── docker-compose.yml        # Infrastructure (Redis VSS + infinity-emb)
+├── .env.example              # Environment configuration template
+├── OBSOLETE.md               # Deprecated files (app.py, Dockerfile)
 │
 ├── mcp-server/               # DMCP Server (TypeScript)
 │   ├── src/
 │   │   ├── dmcp-server.ts    # Runtime server (stdio)
 │   │   ├── dmcp-indexer.ts   # Indexer CLI
-│   │   └── redis-vss.ts      # Redis vector search
+│   │   ├── redis-vss.ts      # Redis vector search
+│   │   └── custom-embedding-provider.ts  # OpenAI API client
+│   ├── scripts/
+│   │   └── generate-config.mjs # Config generator
+│   ├── mcp.json              # Generated config
 │   └── package.json
 │
 ├── gateway/                  # Agent Gateway Configuration
-│   ├── agentgateway          # Binary (download from 1MCP)
+│   ├── agentgateway          # Binary (download from Agent Gateway)
 │   ├── config.yaml           # Generated config (gitignored)
 │   ├── config.yaml.example   # Example config structure
 │   └── config_parts/         # ⚠️ YOUR PRIVATE CONFIGS (gitignored)
-│
-└── one-mcp/                  # MCP Server Registry
-    ├── mcp.json              # Backend SSE endpoints (gitignored)
-    ├── mcp.json.example      # Example config
-    ├── start.sh              # Start gateway
-    └── stop.sh               # Stop gateway
 ```
 
 ## 🚀 Quick Start
@@ -134,7 +152,7 @@ dmcp/
 
 - Docker & Docker Compose
 - Node.js 18+
-- [Agent Gateway binary](https://github.com/1mcp/agentgateway) (for running MCP servers)
+- [Agent Gateway binary](https://github.com/agentgateway/agentgateway) (for running MCP servers)
 
 ### 1. Clone and Setup
 
@@ -142,12 +160,14 @@ dmcp/
 git clone https://github.com/yourusername/dmcp.git
 cd dmcp
 
-# Copy example configs
-cp one-mcp/mcp.json.example one-mcp/mcp.json
-cp gateway/config.yaml.example gateway/config.yaml
+# Configure embedding model (optional - defaults to tool-optimized model)
+cp .env.example .env
+# Edit .env to change EMBEDDING_MODEL if needed
 
-# Edit with your MCP server configurations
-# (Add your API keys, tokens, etc.)
+# Generate MCP config
+cd mcp-server
+node scripts/generate-config.mjs
+cd ..
 ```
 
 ### 2. Start Infrastructure
@@ -157,8 +177,20 @@ cp gateway/config.yaml.example gateway/config.yaml
 docker-compose up -d
 
 # Verify services are healthy
+```bash
+# Start Redis VSS + Embedding Service
+docker-compose up -d
+
+# Verify services are healthy
 curl http://localhost:5000/health
-# → {"status": "healthy", "model": "intfloat/e5-small-v2", "runtime": "onnx"}
+# → {"unix": 1703452800.0}
+
+# Test embedding model
+curl -X POST http://localhost:5000/embeddings \
+  -H "Content-Type: application/json" \
+  -d '{"input":"create a GitHub issue","model":"mangopy/ToolRet-trained-e5-large-v2","encoding_format":"float"}' \
+  | jq '.data[0].embedding | length'
+# → 1024
 
 docker exec mcp-redis-vss redis-cli ping
 # → PONG
@@ -238,7 +270,7 @@ Example queries and what they find:
 | `REDIS_HOST` | localhost | Redis server host |
 | `REDIS_PORT` | 6380 | Redis server port |
 | `EMBEDDING_URL` | http://localhost:5000 | Embedding service URL (indexer only) |
-| `EMBEDDING_MODEL` | intfloat/e5-small-v2 | Embedding model name |
+| `EMBEDDING_MODEL` | mangopy/ToolRet-trained-e5-large-v2 | ToolRet model (1024 dims) |
 | `DMCP_TOP_K` | 30 | Max tools returned per search |
 | `DMCP_MIN_SCORE` | 0.25 | Minimum similarity threshold |
 

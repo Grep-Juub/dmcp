@@ -28,21 +28,6 @@ import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { SSEClientTransport } from '@modelcontextprotocol/sdk/client/sse.js';
 import { RedisVSS, FilteredTool } from './redis-vss.js';
 import { ToolRouter, RouteResult } from './tool-router.js';
-import { readFileSync } from 'fs';
-import { join } from 'path';
-import { homedir } from 'os';
-
-interface MCPServerConfig {
-  command?: string;
-  args?: string[];
-  env?: Record<string, string>;
-  type?: string;
-  url?: string;
-}
-
-interface MCPConfig {
-  mcpServers: Record<string, MCPServerConfig>;
-}
 
 /**
  * Sanitize tool names to conform to MCP naming requirements [a-z0-9_-]
@@ -70,6 +55,9 @@ class DMCPServer {
   // Always-exposed meta tools (LLM enhancement)
   private metaTools: Map<string, Tool> = new Map();
   
+  // Map toolKey -> serverUrl for direct connection
+  private toolServerUrls: Map<string, string> = new Map();
+  
   // Tool usage tracking for eviction
   private toolLastUsed: Map<string, number> = new Map();  // toolKey -> request counter
   private requestCounter = 0;
@@ -77,7 +65,6 @@ class DMCPServer {
   
   // Lazy connection pool for backend servers
   private serverClients: Map<string, Client> = new Map();
-  private serverConfig: MCPConfig | null = null;
   
   // Configuration
   private topK: number;
@@ -183,6 +170,11 @@ class DMCPServer {
         description: `[${tool.serverId}] ${tool.description}`,
         inputSchema: tool.inputSchema || { type: 'object', properties: {} },
       });
+      
+      if (tool.serverUrl) {
+        this.toolServerUrls.set(toolKey, tool.serverUrl);
+      }
+      
       // Mark as fresh (will be kept)
       this.toolLastUsed.set(toolKey, this.requestCounter);
     }
@@ -221,15 +213,6 @@ class DMCPServer {
   }
 
   /**
-   * Load MCP configuration file
-   */
-  private loadMCPConfig(configPath: string): MCPConfig {
-    console.error(`[DMCP] Loading config from ${configPath}`);
-    const content = readFileSync(configPath, 'utf-8');
-    return JSON.parse(content);
-  }
-
-  /**
    * Connect to an SSE MCP Server (lazy - on demand)
    */
   private async connectToSSEServer(serverId: string, url: string): Promise<Client | null> {
@@ -252,24 +235,19 @@ class DMCPServer {
   /**
    * Get or create a client connection to a backend server (lazy)
    */
-  private async getServerClient(serverId: string): Promise<Client | null> {
+  private async getServerClient(serverId: string, serverUrl?: string): Promise<Client | null> {
     // Return existing connection
     if (this.serverClients.has(serverId)) {
       return this.serverClients.get(serverId)!;
     }
 
     // Lazy connect
-    if (!this.serverConfig) {
-      throw new Error('Server config not loaded');
-    }
-
-    const serverCfg = this.serverConfig.mcpServers[serverId];
-    if (!serverCfg || serverCfg.type !== 'sse' || !serverCfg.url) {
-      console.error(`[DMCP] No SSE config for server: ${serverId}`);
+    if (!serverUrl) {
+      console.error(`[DMCP] No server URL provided for: ${serverId}`);
       return null;
     }
 
-    const client = await this.connectToSSEServer(serverId, serverCfg.url);
+    const client = await this.connectToSSEServer(serverId, serverUrl);
     if (client) {
       this.serverClients.set(serverId, client);
     }
@@ -502,10 +480,13 @@ class DMCPServer {
     // Mark tool as used (prevents eviction)
     this.toolLastUsed.set(toolName, this.requestCounter);
 
+    // Get server URL from our map
+    const serverUrl = this.toolServerUrls.get(toolName);
+
     // Lazy connect to backend server
-    const client = await this.getServerClient(serverId);
+    const client = await this.getServerClient(serverId, serverUrl);
     if (!client) {
-      throw new Error(`Cannot connect to server: ${serverId}`);
+      throw new Error(`Cannot connect to server: ${serverId} (URL: ${serverUrl || 'unknown'})`);
     }
 
     console.error(`[DMCP] Forwarding to ${serverId}: ${originalName}`);
@@ -533,7 +514,7 @@ class DMCPServer {
   /**
    * Start the DMCP server
    */
-  async start(configPath: string) {
+  async start() {
     try {
       // Initialize with search meta-tool
       this.exposedTools.set('mcp_dmcp_search_tools', this.getSearchToolDefinition());
@@ -544,7 +525,7 @@ class DMCPServer {
       console.error('[DMCP] Server connected via stdio');
 
       // Background initialization
-      this.initializationPromise = this.initializeInBackground(configPath);
+      this.initializationPromise = this.initializeInBackground();
     } catch (error) {
       console.error('[DMCP] Fatal error:', error);
       process.exit(1);
@@ -555,7 +536,7 @@ class DMCPServer {
    * Background initialization - LAZY: only connects to Redis, not to backends
    * Backend connections are made on-demand when tools are called
    */
-  private async initializeInBackground(configPath: string): Promise<void> {
+  private async initializeInBackground(): Promise<void> {
     try {
       // Connect to Redis (read-only for searching)
       console.error('[DMCP] Connecting to Redis...');
@@ -580,6 +561,11 @@ class DMCPServer {
           description: `[${tool.serverId}] ${tool.description}`,
           inputSchema: tool.inputSchema || { type: 'object', properties: {} },
         });
+        
+        if (tool.serverUrl) {
+          this.toolServerUrls.set(toolKey, tool.serverUrl);
+        }
+        
         // Also add to exposed tools immediately
         this.exposedTools.set(toolKey, this.metaTools.get(toolKey)!);
       }
@@ -588,11 +574,6 @@ class DMCPServer {
         console.error(`[DMCP] ✓ Loaded ${this.metaTools.size} always-available meta tools`);
       }
 
-      // Load config for lazy backend connections (NO connections yet!)
-      this.serverConfig = this.loadMCPConfig(configPath);
-      const serverCount = Object.keys(this.serverConfig.mcpServers).length;
-      console.error(`[DMCP] Loaded config with ${serverCount} backend servers (lazy connection)`);
-      
       // Update search tool description with actual count
       this.exposedTools.set('mcp_dmcp_search_tools', this.getSearchToolDefinition());
       
@@ -606,6 +587,5 @@ class DMCPServer {
 }
 
 // Start the server
-const configPath = process.argv[2] || join(homedir(), 'Work/mcp/mcp-tools/one-mcp/mcp.json');
-console.error(`[DMCP] Starting with config: ${configPath}`);
-new DMCPServer().start(configPath);
+console.error(`[DMCP] Starting server (using Redis for configuration)`);
+new DMCPServer().start();

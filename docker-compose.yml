@@ -26,68 +26,42 @@ services:
     networks:
       - mcp-network
 
-  # Fast Embedding Service using ONNX Runtime (~3-5x faster than PyTorch)
-  # Model is configurable via EMBEDDING_MODEL env var
+  # Infinity Embedding Service with Tool-Optimized Model
+  # Supports any HuggingFace model with OpenAI-compatible API
+  # Default: ToolRet-trained e5-large-v2 for better tool retrieval (1024 dims)
   embedding-service:
-    # platform: linux/arm64  # Uncomment for Apple Silicon (M1/M2/M3)
-    build:
-      context: .
-      dockerfile: Dockerfile
-      args:
-        EMBEDDING_MODEL: ${EMBEDDING_MODEL:-intfloat/e5-small-v2}
-    container_name: mcp-embedding-service
+    image: michaelf34/infinity:latest-cpu  # CPU-optimized image
+    platform: linux/amd64
+    container_name: mcp-embedding-infinity
+    command:
+      - v2
+      - --model-id
+      - ${EMBEDDING_MODEL:-mangopy/ToolRet-trained-e5-large-v2}
+      - --port
+      - "7997"
+      - --engine
+      - torch  # Use torch since model doesn't have ONNX files
     ports:
-      - "5000:5000"
-    environment:
-      - PYTHONUNBUFFERED=1
-      - TRANSFORMERS_CACHE=/app/cache
-      - EMBEDDING_MODEL=${EMBEDDING_MODEL:-intfloat/e5-small-v2}
+      - "5000:7997"  # Map internal 7997 to external 5000 for compatibility
     volumes:
-      - embedding-model-cache:/app/cache
+      - embedding-model-cache:/app/.cache  # HuggingFace cache location
     restart: unless-stopped
     deploy:
       resources:
         limits:
           cpus: '4'
-          memory: 4G
+          memory: 6G  # Larger model needs more memory
         reservations:
           cpus: '2'
-          memory: 2G
+          memory: 3G
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:5000/health"]
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:7997/health"]
       interval: 30s
       timeout: 10s
       retries: 3
-      start_period: 60s
+      start_period: 120s  # First download takes longer
     networks:
       - mcp-network
-
-  # MCP Proxy with Redis VSS (optional - for standalone deployment)
-  # Uncomment to run proxy in Docker instead of locally
-  # mcp-proxy:
-  #   build:
-  #     context: ./mcp-server
-  #     dockerfile: Dockerfile.proxy
-  #   container_name: mcp-redis-proxy
-  #   depends_on:
-  #     redis-vss:
-  #       condition: service_healthy
-  #     embedding-service:
-  #       condition: service_healthy
-  #   environment:
-  #     REDIS_HOST: redis-vss
-  #     REDIS_PORT: 6379
-  #     EMBEDDING_URL: http://embedding-service:5000
-  #     FILTER_TOP_K: 30
-  #     FILTER_MIN_SCORE: 0.25
-  #     NODE_ENV: production
-  #   volumes:
-  #     - ${HOME}/Work/mgmt/main/.vscode/mcp.json:/app/mcp-config.json:ro
-  #   restart: unless-stopped
-  #   networks:
-  #     - mcp-network
-  #   # For stdio transport, you'd connect via docker exec
-  #   # For SSE/HTTP, expose ports here
 
 volumes:
   redis-vss-data:
