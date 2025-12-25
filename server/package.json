@@ -5,13 +5,10 @@
   "type": "module",
   "main": "dist/dmcp-server.js",
   "bin": {
-    "dmcp-server": "dist/dmcp-server.js",
-    "dmcp-indexer": "dist/dmcp-indexer.js"
+    "dmcp-server": "dist/dmcp-server.js"
   },
   "scripts": {
     "build": "tsc",
-    "index": "REDIS_PORT=6380 tsx src/dmcp-indexer.ts",
-    "index:force": "REDIS_PORT=6380 tsx src/dmcp-indexer.ts --force",
     "start": "REDIS_PORT=6380 tsx src/dmcp-server.ts",
     "start:prod": "npm run build && REDIS_PORT=6380 node dist/dmcp-server.js"
   },

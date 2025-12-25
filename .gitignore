@@ -28,10 +28,8 @@ gateway_dump.json
 
 # Temp directories
 tmp/
-mcp-server/tmp/
 
 # Private configs (contain API keys, tokens, secrets)
 gateway/config_parts/
 gateway/config.yaml
 gateway/agentgateway
-one-mcp/mcp.json

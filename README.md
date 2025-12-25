@@ -70,10 +70,10 @@ LLM calls: github_create_issue(...)
                                   │ stdio
                                   ▼
 ┌─────────────────────────────────────────────────────────────────────────────┐
-│                         DMCP Server (dmcp-server.ts)                        │
+│                         DMCP Server (server/)                               │
 │                                                                             │
 │  • Exposes 1 meta-tool: search_tools                                        │
-│  • Hybrid search: text (exact) + vector (semantic)                          │
+│  • Pure vector search (COSINE similarity)                                   │
 │  • Sends listChanged notifications when tools discovered                    │
 │  • Forwards tool calls to backend MCP servers                               │
 └────────────┬──────────────────────────────────────────────────┬─────────────┘
@@ -109,11 +109,11 @@ LLM calls: github_create_issue(...)
 └────────────────────────┘      │
              ▲                  │
              │                  │
-┌────────────────────────────────────────────────────────────────────────────┐
-│                         DMCP Indexer (CLI)                                  │
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                         DMCP Indexer (indexer/)                             │
 │                         npm run index                                       │
 │                                                                             │
-│  1. Connects to all MCP servers via Agent Gateway                          │
+│  1. Connects to MCP servers in parallel (10 concurrent)                     │
 │  2. Discovers tools from each server                                        │
 │  3. Generates embeddings via embedding service                              │
 │  4. Stores in Redis with vector index                                       │
@@ -126,18 +126,18 @@ LLM calls: github_create_issue(...)
 dmcp/
 ├── docker-compose.yml        # Infrastructure (Redis VSS + infinity-emb)
 ├── .env.example              # Environment configuration template
-├── OBSOLETE.md               # Deprecated files (app.py, Dockerfile)
 │
-├── mcp-server/               # DMCP Server (TypeScript)
-│   ├── src/
-│   │   ├── dmcp-server.ts    # Runtime server (stdio)
-│   │   ├── dmcp-indexer.ts   # Indexer CLI
-│   │   ├── redis-vss.ts      # Redis vector search
-│   │   └── custom-embedding-provider.ts  # OpenAI API client
-│   ├── scripts/
-│   │   └── generate-config.mjs # Config generator
-│   ├── mcp.json              # Generated config
-│   └── package.json
+├── server/                   # DMCP Server (TypeScript)
+│   └── src/
+│       ├── dmcp-server.ts    # Runtime server (stdio)
+│       ├── redis-vss.ts      # Redis vector search
+│       └── custom-embedding-provider.ts  # Embedding API client
+│
+├── indexer/                  # Standalone Indexer (TypeScript)
+│   └── src/
+│       ├── index.ts          # CLI indexer with parallel discovery
+│       ├── redis-vss.ts      # Redis vector search
+│       └── custom-embedding-provider.ts  # Embedding API client
 │
 ├── gateway/                  # Agent Gateway Configuration
 │   ├── agentgateway          # Binary (download from Agent Gateway)
@@ -162,12 +162,6 @@ cd dmcp
 
 # Configure embedding model (optional - defaults to tool-optimized model)
 cp .env.example .env
-# Edit .env to change EMBEDDING_MODEL if needed
-
-# Generate MCP config
-cd mcp-server
-node scripts/generate-config.mjs
-cd ..
 ```
 
 ### 2. Start Infrastructure
@@ -199,7 +193,7 @@ docker exec mcp-redis-vss redis-cli ping
 ### 3. Start Agent Gateway
 
 ```bash
-cd one-mcp
+cd gateway
 ./start.sh
 # Gateway exposes MCP servers on ports 3101-3120
 ```
@@ -207,18 +201,18 @@ cd one-mcp
 ### 4. Index Tools
 
 ```bash
-cd mcp-server
+cd indexer
 npm install
-
-# Index all tools in Redis (~33 seconds for 318 tools)
 npm run index
 
 # Output:
-# ═══════════════════════════════════════════════════
-#          DMCP Indexer - Tool Discovery
-# ═══════════════════════════════════════════════════
-# [██████████████████████████████] 100% (318/318)
-# ✓ Indexed 318 tools in 33522ms
+# ╔════════════════════════════════════════════════════════════════╗
+# ║                    DMCP Tool Indexer                           ║
+# ╚════════════════════════════════════════════════════════════════╝
+# ✔ Connected to Redis at localhost:6380
+# ✔ Discovering tools from MCP servers... (parallel, 10 concurrent)
+# ...
+# ✔ Indexed 429 tools in 45.2s
 ```
 
 ### 5. Configure VS Code
@@ -231,9 +225,7 @@ Add to your `.vscode/mcp.json`:
     "dmcp": {
       "command": "node",
       "args": [
-        "/path/to/dmcp/mcp-server/node_modules/.bin/tsx",
-        "/path/to/dmcp/mcp-server/src/dmcp-server.ts",
-        "/path/to/dmcp/one-mcp/mcp.json"
+        "/path/to/dmcp/server/dist/dmcp-server.js"
       ],
       "env": {
         "REDIS_PORT": "6380",
@@ -247,15 +239,16 @@ Add to your `.vscode/mcp.json`:
 
 ## 🔍 How Search Works
 
-DMCP uses **hybrid search** combining:
+DMCP uses **pure vector search** with the ToolRet embedding model:
 
-1. **Text Search** (fast, exact) - "jira" → `jira_get`, `jira_post`, `jira_search`
-2. **Vector Search** (semantic) - "ticket management" → Jira tools via embeddings
+- Model was trained specifically on tool-query pairs
+- Encodes semantic intent directly (no keyword matching needed)
+- Returns top-k tools by COSINE similarity
 
 Example queries and what they find:
 | Query | Finds | Why |
 |-------|-------|-----|
-| `"jira"` | Jira tools | Exact text match |
+| `"create GitHub issue"` | GitHub tools | Semantic match |
 | `"ticket management"` | Jira tools | Semantic similarity |
 | `"check pod logs"` | Kubernetes tools | Semantic match |
 | `"search emails"` | Google Workspace | Semantic match |
@@ -277,8 +270,9 @@ Example queries and what they find:
 ### Indexer CLI
 
 ```bash
-npm run index                # Index (skip if already cached)
-npm run index:force          # Force re-index all tools
+cd indexer
+npm run index         # Index all tools
+npm run index:force   # Force re-index (clear existing)
 ```
 
 ## 🖥️ Server Deployment
@@ -288,8 +282,9 @@ For deploying to your own server:
 1. **Copy your private configs** to `gateway/config_parts/` on your server
 2. **Generate gateway config**: `cat gateway/config_parts/*.yaml > gateway/config.yaml`
 3. **Start services**: `docker-compose up -d`
-4. **Start gateway**: `cd one-mcp && ./start.sh`
-5. **Index tools**: `cd mcp-server && npm run index`
+4. **Start gateway**: `cd gateway && ./start.sh`
+5. **Index tools**: `cd indexer && npm run index`
+6. **Build server**: `cd server && npm run build`
 
 For Apple Silicon (M1/M2/M3), uncomment the `platform: linux/arm64` line in `docker-compose.yml`.
 
@@ -297,11 +292,11 @@ For Apple Silicon (M1/M2/M3), uncomment the `platform: linux/arm64` line in `doc
 
 | Metric | Value |
 |--------|-------|
-| **Tools indexed** | 318 |
-| **Index time** | ~33 seconds |
+| **Tools indexed** | 429 |
+| **Index time** | ~45 seconds |
 | **Search latency** | ~50ms |
 | **Token reduction** | 98% (from ~100k to ~2k) |
-| **Embedding model** | E5-small-v2 (33M params, 384 dims) |
+| **Embedding model** | ToolRet-e5-large-v2 (1024 dims) |
 
 ## 📐 MCP Spec Compliance
 

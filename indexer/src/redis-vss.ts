@@ -211,8 +211,8 @@ export class RedisVSS {
     const total = tools.length;
 
     // Process in chunks with concurrency for better throughput
-    const CHUNK_SIZE = 16;
-    const CONCURRENCY = 2; // Process 2 chunks in parallel (reduced for stability)
+    const CHUNK_SIZE = 32;  // Increased batch size for embedding API
+    const CONCURRENCY = 12; // High concurrency - embedding API is the bottleneck
     
     const allEmbeddings: Float32Array[] = new Array(tools.length);
     let processed = 0;
@@ -234,13 +234,13 @@ export class RedisVSS {
         for (let j = 0; j < embeddings.length; j++) {
           allEmbeddings[chunk.start + j] = embeddings[j];
         }
+        
+        // Update progress after each chunk completes (more frequent updates)
+        processed = Math.min(chunk.end, total);
+        if (onProgress) {
+          onProgress(processed, total);
+        }
       }));
-      
-      // Update progress after each concurrent batch completes
-      processed = Math.min((i + CONCURRENCY) * CHUNK_SIZE, total);
-      if (onProgress) {
-        onProgress(processed, total);
-      }
     }
 
     // Store all tools in Redis using pipeline
