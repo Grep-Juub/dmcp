@@ -4,9 +4,10 @@ Runtime MCP server for dynamic tool discovery via semantic vector search.
 
 ## Research Foundation
 
-Based on **ToolRet: Toolbox Retrieval for Large Language Models** ([ACL 2025](https://aclanthology.org/2025.findings-acl.1258.pdf)):
+Based on **"Retrieval Models Aren't Tool-Savvy"** (Shi et al., ACL 2025 Findings):
 
-- **Model**: `mangopy/ToolRet-trained-e5-large-v2` (1024 dimensions)
+- 📄 [Paper](https://aclanthology.org/2025.findings-acl.1258.pdf) | [GitHub](https://github.com/mangopy/tool-retrieval-benchmark)
+- 🤗 [Model: mangopy/ToolRet-trained-e5-large-v2](https://huggingface.co/mangopy/ToolRet-trained-e5-large-v2) (1024 dimensions)
 - **Approach**: Pure vector search - no heuristic filtering
 
 ## Quick Start

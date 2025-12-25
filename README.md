@@ -11,21 +11,24 @@ This project was inspired by:
 
 ## 🔬 Research Foundation
 
-Implementation based on **ToolRet: Toolbox Retrieval for Large Language Models**:
+Implementation based on **"Retrieval Models Aren't Tool-Savvy: Benchmarking Tool Retrieval for Large Language Models"**:
 
-- 📄 **Paper**: [ACL 2025 Findings](https://aclanthology.org/2025.findings-acl.1258.pdf)
-- 🎯 **Key Insight**: Tool-specific contrastive learning significantly improves LLM tool selection
+- 📄 **Paper**: [ACL 2025 Findings](https://aclanthology.org/2025.findings-acl.1258.pdf) | [DOI](https://doi.org/10.18653/v1/2025.findings-acl.1258)
+- 🏠 **Project**: [GitHub](https://github.com/mangopy/tool-retrieval-benchmark) | [Leaderboard](https://huggingface.co/spaces/mangopy/ToolRet-leaderboard)
 - 🤗 **Model**: [`mangopy/ToolRet-trained-e5-large-v2`](https://huggingface.co/mangopy/ToolRet-trained-e5-large-v2) (1024 dimensions)
-- ⚡ **Performance**: Superior retrieval accuracy compared to general-purpose embeddings
-- 🏗️ **Architecture**: E5-large-v2 base, fine-tuned on tool-query pairs with contrastive learning
+- 🎯 **Key Insight**: General IR models perform poorly on tool retrieval; tool-specific training is essential
+- 🏗️ **Architecture**: E5-large-v2 fine-tuned on 200k+ tool-query pairs with contrastive learning
 
 **Citation**:
 ```bibtex
-@inproceedings{li2025toolret,
-  title={ToolRet: Toolbox Retrieval for Large Language Models},
-  author={Li, Ziang and Chen, Zhiyu and others},
+@inproceedings{shi-etal-2025-retrieval,
+  title={Retrieval Models Aren't Tool-Savvy: Benchmarking Tool Retrieval for Large Language Models},
+  author={Shi, Zhengliang and Wang, Yuhan and Yan, Lingyong and Ren, Pengjie and Wang, Shuaiqiang and Yin, Dawei and Ren, Zhaochun},
   booktitle={Findings of the Association for Computational Linguistics: ACL 2025},
+  pages={24497--24524},
   year={2025},
+  address={Vienna, Austria},
+  publisher={Association for Computational Linguistics},
   url={https://aclanthology.org/2025.findings-acl.1258}
 }
 ```
@@ -73,50 +76,48 @@ LLM calls: github_create_issue(...)
 │                         DMCP Server (server/)                               │
 │                                                                             │
 │  • Exposes 1 meta-tool: search_tools                                        │
-│  • Pure vector search (COSINE similarity)                                   │
+│  • Pure vector search (COSINE similarity, HNSW index)                       │
 │  • Sends listChanged notifications when tools discovered                    │
-│  • Forwards tool calls to backend MCP servers                               │
+│  • Forwards tool calls to backend MCP servers via SSE                       │
 └────────────┬──────────────────────────────────────────────────┬─────────────┘
              │                                                  │
-             │ Query embeddings                                 │ Tool calls
+             │ Query embeddings                                 │ Tool calls (SSE)
              ▼                                                  ▼
 ┌────────────────────────┐                        ┌────────────────────────────┐
 │   Redis Stack (VSS)    │                        │     Agent Gateway          │
-│   Port: 6380           │                        │     (1MCP/agentgateway)    │
+│   Port: 6380           │                        │     Port: 15000            │
 │                        │                        │                            │
 │  ┌──────────────────┐  │                        │  ┌──────────────────────┐  │
 │  │  Vector Index    │  │                        │  │  20+ MCP Servers     │  │
-│  │  (HNSW, COSINE)  │  │                        │  │  via SSE endpoints   │  │
-│  │  318 tool embeds │  │                        │  │  Ports 3101-3120     │  │
-│  └──────────────────┘  │                        │  └──────────────────────┘  │
-│                        │                        │                            │
-│  ┌──────────────────┐  │                        │  • GitHub                  │
-│  │  Text Index      │  │                        │  • Google Workspace        │
-│  │  (Full-text)     │  │                        │  • Jira/Confluence         │
-│  └──────────────────┘  │                        │  • Kubernetes              │
-└────────────────────────┘                        │  • Grafana/Datadog         │
-             ▲                                    │  • AWS/Azure               │
-             │ Generate embeddings                │  • PostgreSQL              │
-             │                                    │  • And more...             │
+│  │  HNSW + COSINE   │  │                        │  │  (SSE endpoints)     │  │
+│  │  400+ tools      │  │                        │  └──────────────────────┘  │
+│  └──────────────────┘  │                        │                            │
+│                        │                        │  • GitHub, Jira, Confluence│
+└────────────────────────┘                        │  • Google Workspace        │
+             ▲                                    │  • Kubernetes, AWS, Azure  │
+             │                                    │  • Grafana, Datadog        │
+             │                                    │  • PostgreSQL, and more... │
 ┌────────────────────────┐                        └────────────────────────────┘
 │  Infinity Embedding    │                                     ▲
 │  Port: 5000            │                                     │
 │                        │                                     │
-│  • Tool-optimized      │      ┌──────────────────────────────┘
-│  • ToolRet e5-large-v2 │      │
-│  • 1024 dimensions     │      │ Index tools at startup
-│  • OpenAI-compatible   │      │
+│  • ToolRet e5-large-v2 │      ┌──────────────────────────────┘
+│  • 1024 dimensions     │      │
+│  • OpenAI-compatible   │      │ Fetch config + discover tools
 └────────────────────────┘      │
              ▲                  │
+             │ Generate         │
+             │ embeddings       │
              │                  │
 ┌─────────────────────────────────────────────────────────────────────────────┐
 │                         DMCP Indexer (indexer/)                             │
 │                         npm run index                                       │
 │                                                                             │
-│  1. Connects to MCP servers in parallel (10 concurrent)                     │
-│  2. Discovers tools from each server                                        │
-│  3. Generates embeddings via embedding service                              │
-│  4. Stores in Redis with vector index                                       │
+│  1. Fetches MCP server config from Agent Gateway (/config_dump)             │
+│  2. Connects to servers in parallel (10 concurrent)                         │
+│  3. Discovers tools from each server                                        │
+│  4. Generates embeddings via Infinity service                               │
+│  5. Stores tools + vectors in Redis                                         │
 └─────────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -260,9 +261,10 @@ Example queries and what they find:
 
 | Variable | Default | Description |
 |----------|---------|-------------|
+| `MCP_GATEWAY_URL` | http://127.0.0.1:15000/config_dump | Agent Gateway config endpoint (indexer) |
 | `REDIS_HOST` | localhost | Redis server host |
 | `REDIS_PORT` | 6380 | Redis server port |
-| `EMBEDDING_URL` | http://localhost:5000 | Embedding service URL (indexer only) |
+| `EMBEDDING_URL` | http://localhost:5000 | Embedding service URL |
 | `EMBEDDING_MODEL` | mangopy/ToolRet-trained-e5-large-v2 | ToolRet model (1024 dims) |
 | `DMCP_TOP_K` | 30 | Max tools returned per search |
 | `DMCP_MIN_SCORE` | 0.25 | Minimum similarity threshold |
@@ -271,8 +273,9 @@ Example queries and what they find:
 
 ```bash
 cd indexer
-npm run index         # Index all tools
-npm run index:force   # Force re-index (clear existing)
+npm run index             # Index all tools from gateway
+npm run index:force       # Force re-index (clear existing)
+npm run index -- -s name  # Index only specific server
 ```
 
 ## 🖥️ Server Deployment
