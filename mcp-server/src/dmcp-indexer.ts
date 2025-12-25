@@ -18,8 +18,6 @@
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { SSEClientTransport } from '@modelcontextprotocol/sdk/client/sse.js';
 import { RedisVSS, ToolMetadata } from './redis-vss.js';
-import { EmbeddingClassifier, classifyToolHeuristic, type ToolDomain } from './tool-classifier.js';
-import { CapabilityClusterer, formatDomainStats } from './tool-router.js';
 import { readFileSync } from 'fs';
 import { join } from 'path';
 
@@ -44,7 +42,6 @@ interface IndexerOptions {
   redisPort: number;
   redisPassword?: string;
   embeddingURL: string;
-  classifyTools: boolean;
   targetServer?: string;  // Optional: specific server to index (name or port)
 }
 
@@ -61,7 +58,6 @@ function parseArgs(): IndexerOptions {
     redisPort: parseInt(process.env.REDIS_PORT || '6380'),
     redisPassword: process.env.REDIS_PASSWORD,
     embeddingURL: process.env.EMBEDDING_URL || 'http://localhost:5000',
-    classifyTools: process.env.CLASSIFY_TOOLS !== 'false',  // Default: true
     targetServer: process.env.TARGET_SERVER,  // Optional: index specific server only
   };
 
@@ -390,88 +386,7 @@ async function main() {
       process.exit(1);
     }
 
-    // ============ CLASSIFICATION STEP ============
-    console.log('🏷️  Classifying tools (category + domain)...');
-    
-    const classificationStartTime = Date.now();
-    
-    if (options.classifyTools) {
-      console.log('   Using embedding-based classification');
-      
-      const classifier = new EmbeddingClassifier({
-        embeddingURL: options.embeddingURL,
-      });
-
-      // Use full classification (category + domain)
-      const classifications = await classifier.classifyFullBatch(
-        tools.map(t => ({ name: t.name, description: t.description, serverId: t.serverId })),
-        (current, total) => {
-          const percent = Math.floor((current / total) * 100);
-          process.stdout.write(`\r   Classifying: ${percent}% (${current}/${total})     `);
-        }
-      );
-      
-      process.stdout.write('\r' + ' '.repeat(60) + '\r');
-
-      // Apply classifications to tools
-      for (const tool of tools) {
-        const result = classifications.get(tool.name);
-        tool.category = result?.category || 'general';
-        tool.domain = result?.domain || 'general';
-      }
-
-      // Category stats
-      const categoryStats = { meta: 0, query: 0, action: 0, general: 0 };
-      for (const tool of tools) {
-        categoryStats[tool.category as keyof typeof categoryStats]++;
-      }
-      console.log(`   ✓ Classification complete (${Date.now() - classificationStartTime}ms)`);
-      console.log(`     Categories: meta: ${categoryStats.meta} | query: ${categoryStats.query} | action: ${categoryStats.action} | general: ${categoryStats.general}`);
-      
-      // Domain stats
-      const domainStats: Record<ToolDomain, number> = {
-        api: 0, terminal: 0, browser: 0, reasoning: 0, 
-        filesystem: 0, data: 0, observability: 0, cloud: 0, general: 0
-      };
-      for (const tool of tools) {
-        if (tool.domain) {
-          domainStats[tool.domain as ToolDomain]++;
-        }
-      }
-      console.log(`     Domains: ${formatDomainStats(domainStats)}`);
-      
-      // ============ CAPABILITY CLUSTERING STEP ============
-      console.log('');
-      console.log('🔗 Clustering similar tools...');
-      
-      const clusterer = new CapabilityClusterer(classifier.getDomainClassifier().getEmbeddingProvider());
-      const clusters = await clusterer.clusterTools(
-        tools.map(t => ({ name: t.name, description: t.description }))
-      );
-      
-      // Apply cluster IDs to tools
-      for (const tool of tools) {
-        tool.clusterId = clusters.get(tool.name);
-      }
-      
-    } else {
-      console.log('   Using heuristic classification (--no-classify)');
-      
-      for (const tool of tools) {
-        tool.category = classifyToolHeuristic(tool.name, tool.description);
-        tool.domain = 'general';  // Default domain when using heuristics
-      }
-
-      // Count categories
-      const stats = { meta: 0, query: 0, action: 0, general: 0 };
-      for (const tool of tools) {
-        stats[tool.category as keyof typeof stats]++;
-      }
-      
-      console.log(`   ✓ Classification complete`);
-      console.log(`     • meta: ${stats.meta} | query: ${stats.query} | action: ${stats.action} | general: ${stats.general}`);
-    }
-    console.log('');
+    // No classification needed - embeddings handle semantic matching
 
     // Index tools with progress bar
     console.log('📥 Indexing tools in Redis...');

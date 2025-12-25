@@ -22,9 +22,6 @@ export interface ToolMetadata {
   name: string;
   description: string;
   inputSchema?: any;
-  category?: string;
-  domain?: string;      // Tool domain for smart routing (api, terminal, browser, etc.)
-  clusterId?: string;   // Capability cluster ID for deduplication
   keywords?: string[];
 }
 
@@ -167,18 +164,6 @@ export class RedisVSS {
             type: 'TEXT' as any,
             AS: 'description'
           },
-          '$.category': {
-            type: 'TAG' as any,
-            AS: 'category'
-          },
-          '$.domain': {
-            type: 'TAG' as any,
-            AS: 'domain'
-          },
-          '$.clusterId': {
-            type: 'TAG' as any,
-            AS: 'clusterId'
-          },
           '$.vector': {
             type: 'VECTOR' as any,
             ALGORITHM: 'HNSW' as any,
@@ -290,14 +275,12 @@ export class RedisVSS {
       topK?: number;
       minScore?: number;
       serverIds?: string[];
-      categories?: string[];
     } = {}
   ): Promise<FilteredTool[]> {
     const {
       topK = 5,
       minScore = 0.3,
-      serverIds,
-      categories
+      serverIds
     } = options;
 
     const startTime = Date.now();
@@ -307,9 +290,6 @@ export class RedisVSS {
     const filters: string[] = [];
     if (serverIds && serverIds.length > 0) {
       filters.push(`@serverId:{${serverIds.join('|')}}`);
-    }
-    if (categories && categories.length > 0) {
-      filters.push(`@category:{${categories.join('|')}}`);
     }
 
     // ============ VECTOR SEARCH ============
@@ -328,7 +308,7 @@ export class RedisVSS {
         this.indexName,
         `${searchQuery}=>[KNN ${topK * 2} @vector $query_vector AS __vector_score]`,
         {
-          RETURN: ['serverId', 'name', 'description', 'category', 'inputSchema', 'domain', 'clusterId', 'serverUrl', '__vector_score'],
+          RETURN: ['serverId', 'name', 'description', 'inputSchema', 'serverUrl', '__vector_score'],
           SORTBY: {
             BY: '__vector_score',
             DIRECTION: 'ASC'
@@ -362,9 +342,6 @@ export class RedisVSS {
         serverUrl: doc.value.serverUrl as string,
         name: doc.value.name as string,
         description: doc.value.description as string,
-        category: doc.value.category as string,
-        domain: doc.value.domain as string | undefined,
-        clusterId: doc.value.clusterId as string | undefined,
         inputSchema: doc.value.inputSchema,
         score: score
       };
@@ -430,45 +407,6 @@ export class RedisVSS {
       // Index might not exist
     }
   }
-
-  /**
-   * Get all tools in a specific category
-   * Used to always expose 'meta' category tools for LLM enhancement
-   */
-  async getToolsByCategory(category: string): Promise<FilteredTool[]> {
-    const tools: FilteredTool[] = [];
-
-    try {
-      const results = await this.client.ft.search(
-        this.indexName,
-        `@category:{${category}}`,
-        {
-          RETURN: ['serverId', 'name', 'description', 'category', 'inputSchema', 'serverUrl'],
-          LIMIT: { from: 0, size: 100 }  // Assume < 100 meta tools
-        }
-      );
-
-      for (const doc of results.documents) {
-        tools.push({
-          id: doc.id.split(':')[2],
-          serverId: doc.value.serverId as string,
-          serverUrl: doc.value.serverUrl as string,
-          name: doc.value.name as string,
-          description: doc.value.description as string,
-          category: doc.value.category as string,
-          inputSchema: doc.value.inputSchema,
-          score: 1.0  // Always-exposed tools get perfect score
-        });
-      }
-
-      console.error(`[RedisVSS] Found ${tools.length} tools with category '${category}'`);
-    } catch (error) {
-      console.error(`[RedisVSS] Error fetching ${category} tools:`, (error as Error).message);
-    }
-
-    return tools;
-  }
-
   /**
    * Get all tools from Redis (for quality auditing and analysis)
    */
@@ -481,7 +419,7 @@ export class RedisVSS {
         this.indexName,
         '*',
         {
-          RETURN: ['serverId', 'name', 'description', 'category', 'inputSchema', 'domain', 'clusterId', 'serverUrl', 'keywords'],
+          RETURN: ['serverId', 'name', 'description', 'inputSchema', 'serverUrl', 'keywords'],
           LIMIT: { from: 0, size: 10000 }  // Adjust if you have more tools
         }
       );
@@ -493,9 +431,6 @@ export class RedisVSS {
           serverUrl: doc.value.serverUrl as string,
           name: doc.value.name as string,
           description: doc.value.description as string,
-          category: doc.value.category as string,
-          domain: doc.value.domain as string | undefined,
-          clusterId: doc.value.clusterId as string | undefined,
           inputSchema: doc.value.inputSchema,
           keywords: doc.value.keywords ? JSON.parse(doc.value.keywords as string) : undefined,
         });

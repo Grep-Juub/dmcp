@@ -27,7 +27,6 @@ import {
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { SSEClientTransport } from '@modelcontextprotocol/sdk/client/sse.js';
 import { RedisVSS, FilteredTool } from './redis-vss.js';
-import { ToolRouter, RouteResult } from './tool-router.js';
 
 /**
  * Sanitize tool names to conform to MCP naming requirements [a-z0-9_-]
@@ -47,7 +46,6 @@ function sanitizeToolName(name: string): string {
 class DMCPServer {
   private server: Server;
   private redis: RedisVSS;
-  private toolRouter: ToolRouter;
   
   // Currently exposed tools (dynamic subset)
   private exposedTools: Map<string, Tool> = new Map();
@@ -101,25 +99,38 @@ class DMCPServer {
       embeddingDimensions: 384,
     });
 
-    // Initialize router (will load pre-computed clusters from Redis)
-    this.toolRouter = new ToolRouter();
-
     this.setupHandlers();
   }
 
   /**
    * The search_tools meta-tool definition
+   * 
+   * Based on Anthropic's official Tool Search Tool pattern:
+   * https://github.com/anthropics/claude-cookbooks/blob/main/tool_use/tool_search_with_embeddings.ipynb
+   * 
+   * Key principle: Generic, action-oriented description that tells the LLM
+   * "use this when you need a tool but don't have it available yet"
    */
   private getSearchToolDefinition(): Tool {
+    // More assertive description that competes with built-in tools
+    // Key: Make it clear this provides BETTER/MORE capabilities than defaults
+    const description = [
+      `Search for relevant tools based on your task.`,
+      `This server has ${this.totalToolCount} tools indexed across multiple services`,
+      `(GitHub, Google Workspace, AWS, Kubernetes, Datadog, Grafana, Jira, etc.).`,
+      `Use this tool FIRST to discover which tools are available for your specific task.`,
+      `Returns the top ${this.topK} most relevant tools.`,
+    ].join(' ');
+    
     return {
       name: 'mcp_dmcp_search_tools',
-      description: `Search for relevant tools based on your task. This server has ${this.totalToolCount} tools indexed across multiple services (GitHub, Google Workspace, AWS, Kubernetes, Datadog, Grafana, Jira, etc.). Use this tool FIRST to discover which tools are available for your specific task. Returns the top ${this.topK} most relevant tools.`,
+      description,
       inputSchema: {
         type: 'object',
         properties: {
           query: {
             type: 'string',
-            description: 'Describe what you want to do. Examples: "create a GitHub issue", "search emails", "check Kubernetes pod status", "query AWS costs"',
+            description: `Describe what you want to do. Examples: "create a GitHub issue", "search emails", "check Kubernetes pod status", "query AWS costs"`,
           },
           limit: {
             type: 'number',
@@ -357,78 +368,21 @@ class DMCPServer {
 
     console.error(`[DMCP] Found ${rawTools.length} candidate tools from Redis`);
 
-    // Apply intent filtering if detected
-    let filteredTools = rawTools;
-    if (intent && filteredTools.length > 3) {
-      const beforeCount = filteredTools.length;
-      filteredTools = this.filterByIntent(filteredTools, intent);
-      if (filteredTools.length < beforeCount) {
-        console.error(`[DMCP] Intent filter: ${beforeCount} → ${filteredTools.length} tools`);
-      }
-    }
-
-    // Apply smart routing: deduplicate by capability cluster, prioritize by domain
-    const routeResult = this.toolRouter.route(filteredTools, query);
-    
-    if (routeResult.forcedDomain) {
-      console.error(`[DMCP] Forced domain: ${routeResult.forcedDomain}`);
-    }
-    if (routeResult.forcedTenant) {
-      console.error(`[DMCP] Forced tenant: ${routeResult.forcedTenant}`);
-    }
-    if (routeResult.deduplicatedCount > 0) {
-      console.error(`[DMCP] Routed: ${filteredTools.length} → ${routeResult.tools.length} tools (deduplicated ${routeResult.deduplicatedCount})`);
-    }
-
-    // Limit to requested count after routing
-    const finalTools = routeResult.tools.slice(0, limit);
+    // NO FILTERING - Trust the vector embeddings completely
+    // The ToolRet model is specifically trained for tool selection
+    const finalTools = rawTools.slice(0, limit);
 
     // Update exposed tools and notify
     this.updateExposedTools(finalTools);
 
-    // Build alternate servers lookup for display
-    const toolAlternates = new Map<string, string[]>();
-    if (routeResult.alternateServers) {
-      for (const tool of finalTools) {
-        if (tool.clusterId && routeResult.alternateServers.has(tool.clusterId)) {
-          const allServers = routeResult.alternateServers.get(tool.clusterId)!;
-          // Only show alternates (exclude the current server)
-          const alternates = allServers.filter(s => s !== tool.serverId);
-          if (alternates.length > 0) {
-            toolAlternates.set(tool.id, alternates);
-          }
-        }
-      }
-    }
-
-    // Return formatted results for LLM with routing info
+    // Return formatted results - simple and clean
     const toolList = finalTools.map((t, i) => {
       const toolKey = sanitizeToolName(`${t.serverId}_${t.name}`);
       const domainInfo = t.domain ? ` [${t.domain}]` : '';
-      let entry = `${i + 1}. **${toolKey}**${domainInfo} (score: ${t.score.toFixed(2)})\n   ${t.description}`;
-      
-      // Add alternate servers info if available
-      const alternates = toolAlternates.get(t.id);
-      if (alternates && alternates.length > 0) {
-        entry += `\n   _Also available from: ${alternates.join(', ')}_`;
-      }
-      
-      return entry;
+      return `${i + 1}. **${toolKey}**${domainInfo} (score: ${t.score.toFixed(2)})\n   ${t.description}`;
     }).join('\n\n');
 
-    let response = `Found ${finalTools.length} relevant tools for "${query}":\n\n${toolList}\n\n`;
-    
-    if (routeResult.forcedTenant) {
-      response += `Note: Targeting **${routeResult.forcedTenant}** based on your query.\n`;
-    }
-    if (routeResult.forcedDomain) {
-      response += `Note: Preferring ${routeResult.forcedDomain} tools based on your query.\n`;
-    }
-    if (routeResult.deduplicatedCount > 0) {
-      response += `Deduplicated ${routeResult.deduplicatedCount} similar tools from different servers.\n`;
-    }
-    
-    response += `These tools are now available. You can call them directly by name.`;
+    const response = `Found ${finalTools.length} relevant tools for "${query}":\n\n${toolList}\n\nThese tools are now available. You can call them directly by name.`;
 
     return {
       content: [{ type: 'text', text: response }],
@@ -552,27 +506,7 @@ class DMCPServer {
         console.error(`[DMCP] ✓ Found ${this.totalToolCount} indexed tools`);
       }
 
-      // Load meta tools (always exposed for LLM enhancement)
-      const metaToolsFromRedis = await this.redis.getToolsByCategory('meta');
-      for (const tool of metaToolsFromRedis) {
-        const toolKey = sanitizeToolName(`${tool.serverId}_${tool.name}`);
-        this.metaTools.set(toolKey, {
-          name: toolKey,
-          description: `[${tool.serverId}] ${tool.description}`,
-          inputSchema: tool.inputSchema || { type: 'object', properties: {} },
-        });
-        
-        if (tool.serverUrl) {
-          this.toolServerUrls.set(toolKey, tool.serverUrl);
-        }
-        
-        // Also add to exposed tools immediately
-        this.exposedTools.set(toolKey, this.metaTools.get(toolKey)!);
-      }
-      
-      if (this.metaTools.size > 0) {
-        console.error(`[DMCP] ✓ Loaded ${this.metaTools.size} always-available meta tools`);
-      }
+      // Meta tools are handled through regular search - no special loading needed
 
       // Update search tool description with actual count
       this.exposedTools.set('mcp_dmcp_search_tools', this.getSearchToolDefinition());
