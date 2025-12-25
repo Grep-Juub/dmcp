@@ -268,14 +268,21 @@ Example queries and what they find:
 | `EMBEDDING_MODEL` | mangopy/ToolRet-trained-e5-large-v2 | ToolRet model (1024 dims) |
 | `DMCP_TOP_K` | 30 | Max tools returned per search |
 | `DMCP_MIN_SCORE` | 0.25 | Minimum similarity threshold |
+| `SYNC_INTERVAL` | 60 | Worker mode sync interval (seconds) |
 
 ### Indexer CLI
 
 ```bash
 cd indexer
+
+# Manual mode (run once)
 npm run index             # Index all tools from gateway
 npm run index:force       # Force re-index (clear existing)
 npm run index -- -s name  # Index only specific server
+
+# Worker mode (continuous sync)
+npm run worker            # Sync every 60s (default)
+npm run worker -- -i 30   # Sync every 30s
 ```
 
 ## 🖥️ Server Deployment
@@ -287,7 +294,8 @@ For deploying to your own server:
 3. **Start services**: `docker-compose up -d`
 4. **Start gateway**: `cd gateway && ./start.sh`
 5. **Index tools**: `cd indexer && npm run index`
-6. **Build server**: `cd server && npm run build`
+6. **Start worker** (optional): `cd indexer && npm run worker` (keeps index in sync)
+7. **Build server**: `cd server && npm run build`
 
 For Apple Silicon (M1/M2/M3), uncomment the `platform: linux/arm64` line in `docker-compose.yml`.
 

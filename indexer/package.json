@@ -11,6 +11,8 @@
     "build": "tsc",
     "start": "tsx src/index.ts",
     "index": "tsx src/index.ts",
+    "index:force": "tsx src/index.ts --force",
+    "worker": "tsx src/index.ts --worker",
     "dev": "tsx watch src/index.ts"
   },
   "dependencies": {

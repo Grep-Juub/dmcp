@@ -397,6 +397,26 @@ export class RedisVSS {
   }
 
   /**
+   * Remove a specific tool by serverId and toolId
+   */
+  async removeTool(serverId: string, toolId: string): Promise<boolean> {
+    const key = `tool:${serverId}:${toolId}`;
+    const deleted = await this.client.del(key);
+    return deleted > 0;
+  }
+
+  /**
+   * Remove all tools from a specific server
+   */
+  async removeServerTools(serverId: string): Promise<number> {
+    const keys = await this.client.keys(`tool:${serverId}:*`);
+    if (keys.length > 0) {
+      await this.client.del(keys);
+    }
+    return keys.length;
+  }
+
+  /**
    * Drop the index entirely
    */
   async dropIndex(): Promise<void> {
