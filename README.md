@@ -70,48 +70,52 @@ LLM calls: github_create_issue(...)
 │        ◄─────────────────────────────                                       │
 │  Returns: 15 k8s tools (get_pods, list_deployments, describe_service...)   │
 └─────────────────────────────────┬───────────────────────────────────────────┘
-                                  │ stdio
+                                  │ HTTP (Streamable HTTP Transport)
                                   ▼
 ┌─────────────────────────────────────────────────────────────────────────────┐
 │                         DMCP Server (server/)                               │
+│                         http://localhost:3001/mcp                           │
 │                                                                             │
 │  • Exposes 1 meta-tool: search_tools                                        │
 │  • Pure vector search (COSINE similarity, HNSW index)                       │
 │  • Sends listChanged notifications when tools discovered                    │
 │  • Forwards tool calls to backend MCP servers via SSE                       │
+│  • Runs in Docker container (Streamable HTTP transport)                     │
 └────────────┬──────────────────────────────────────────────────┬─────────────┘
              │                                                  │
              │ Query embeddings                                 │ Tool calls (SSE)
              ▼                                                  ▼
-┌────────────────────────┐                        ┌────────────────────────────┐
-│   Redis Stack (VSS)    │                        │     Agent Gateway          │
-│   Port: 6380           │                        │     Port: 15000            │
-│                        │                        │                            │
-│  ┌──────────────────┐  │                        │  ┌──────────────────────┐  │
-│  │  Vector Index    │  │                        │  │  20+ MCP Servers     │  │
-│  │  HNSW + COSINE   │  │                        │  │  (SSE endpoints)     │  │
-│  │  400+ tools      │  │                        │  └──────────────────────┘  │
-│  └──────────────────┘  │                        │                            │
-│                        │                        │  • GitHub, Jira, Confluence│
-└────────────────────────┘                        │  • Google Workspace        │
+┌────────────────────────────────┐                ┌────────────────────────────┐
+│   Redis Stack (VSS)            │                │     Agent Gateway          │
+│   Container: mcp-redis-vss     │                │     Port: 15000            │
+│   Host Port: 6380              │                │                            │
+│                                │                │  ┌──────────────────────┐  │
+│  ┌──────────────────┐          │                │  │  20+ MCP Servers     │  │
+│  │  Vector Index    │          │                │  │  (SSE endpoints)     │  │
+│  │  HNSW + COSINE   │          │                │  └──────────────────────┘  │
+│  │  400+ tools      │          │                │                            │
+│  └──────────────────┘          │                │  • GitHub, Jira, Confluence│
+└────────────────────────────────┘                │  • Google Workspace        │
              ▲                                    │  • Kubernetes, AWS, Azure  │
              │                                    │  • Grafana, Datadog        │
              │                                    │  • PostgreSQL, and more... │
-┌────────────────────────┐                        └────────────────────────────┘
-│  Infinity Embedding    │                                     ▲
-│  Port: 5000            │                                     │
-│                        │                                     │
-│  • ToolRet e5-large-v2 │      ┌──────────────────────────────┘
-│  • 1024 dimensions     │      │
-│  • OpenAI-compatible   │      │ Fetch config + discover tools
-└────────────────────────┘      │
-             ▲                  │
-             │ Generate         │
-             │ embeddings       │
-             │                  │
+┌────────────────────────────────┐                └────────────────────────────┘
+│  Infinity Embedding Service    │                             ▲
+│  Container: mcp-embedding-     │                             │
+│             infinity           │                             │
+│  Host Port: 5000               │      ┌──────────────────────┘
+│                                │      │
+│  • ToolRet e5-large-v2         │      │ Fetch config + discover tools
+│  • 1024 dimensions             │      │
+│  • OpenAI-compatible API       │      │
+└────────────────────────────────┘      │
+             ▲                          │
+             │ Generate                 │
+             │ embeddings               │
+             │                          │
 ┌─────────────────────────────────────────────────────────────────────────────┐
 │                         DMCP Indexer (indexer/)                             │
-│                         npm run index                                       │
+│                         docker compose run --rm indexer                     │
 │                                                                             │
 │  1. Fetches MCP server config from Agent Gateway (/config_dump)             │
 │  2. Connects to servers in parallel (10 concurrent)                         │
@@ -125,16 +129,18 @@ LLM calls: github_create_issue(...)
 
 ```
 dmcp/
-├── docker-compose.yml        # Infrastructure (Redis VSS + infinity-emb)
+├── docker-compose.yml        # Full stack (Redis, Embedding, DMCP Server)
 ├── .env.example              # Environment configuration template
 │
-├── server/                   # DMCP Server (TypeScript)
+├── server/                   # DMCP Server (TypeScript, Streamable HTTP)
+│   ├── Dockerfile            # Container build
 │   └── src/
-│       ├── dmcp-server.ts    # Runtime server (stdio)
+│       ├── dmcp-server.ts    # HTTP server with MCP transport
 │       ├── redis-vss.ts      # Redis vector search
 │       └── custom-embedding-provider.ts  # Embedding API client
 │
 ├── indexer/                  # Standalone Indexer (TypeScript)
+│   ├── Dockerfile            # Container build
 │   └── src/
 │       ├── index.ts          # CLI indexer with parallel discovery
 │       ├── redis-vss.ts      # Redis vector search
@@ -144,7 +150,12 @@ dmcp/
 │   ├── agentgateway          # Binary (download from Agent Gateway)
 │   ├── config.yaml           # Generated config (gitignored)
 │   ├── config.yaml.example   # Example config structure
+│   ├── start.sh              # Start gateway script
+│   ├── stop.sh               # Stop gateway script
 │   └── config_parts/         # ⚠️ YOUR PRIVATE CONFIGS (gitignored)
+│
+└── .vscode/
+    └── mcp.json              # VS Code MCP configuration
 ```
 
 ## 🚀 Quick Start
@@ -152,7 +163,7 @@ dmcp/
 ### Prerequisites
 
 - Docker & Docker Compose
-- Node.js 18+
+- Node.js 18+ (only for local development)
 - [Agent Gateway binary](https://github.com/agentgateway/agentgateway) (for running MCP servers)
 
 ### 1. Clone and Setup
@@ -161,49 +172,48 @@ dmcp/
 git clone https://github.com/yourusername/dmcp.git
 cd dmcp
 
-# Configure embedding model (optional - defaults to tool-optimized model)
+# Configure environment (optional - defaults work out of the box)
 cp .env.example .env
 ```
 
-### 2. Start Infrastructure
+### 2. Start Agent Gateway
 
-```bash
-# Start Redis VSS + Embedding Service
-docker-compose up -d
-
-# Verify services are healthy
-curl http://localhost:5000/health
-# → {"unix": 1703452800.0}
-
-docker exec mcp-redis-vss redis-cli ping
-# → PONG
-```
-
-### 3. Start Agent Gateway
+The Agent Gateway provides your MCP servers (GitHub, Jira, AWS, etc.):
 
 ```bash
 cd gateway
+
+# Create your config from parts (or use config.yaml.example as template)
+cat config_parts/*.yaml > config.yaml
+
+# Start the gateway
 ./start.sh
 # Gateway exposes MCP servers on port 15000
 ```
 
-### 4. Index Tools
+### 3. Start Infrastructure + DMCP Server
 
-**Option A: Using Docker (recommended)**
 ```bash
-# One-shot indexing via Docker
-docker-compose run --rm indexer
+# Start everything: Redis, Embedding Service, and DMCP Server
+docker compose up -d
 
-# Or start the worker for continuous sync
-docker-compose --profile worker up -d
+# Check status
+docker compose ps
+
+# Verify services are healthy
+curl http://localhost:3001/health
+# → {"status":"healthy","toolCount":0,"activeSessions":0,"uptime":10}
 ```
 
-**Option B: Local Node.js**
+### 4. Index Tools
+
 ```bash
-cd indexer
-npm install
-npm run index         # One-shot
-npm run worker        # Continuous sync
+# Run the indexer to populate Redis with tools from Agent Gateway
+docker compose run --rm indexer
+
+# Verify tools are indexed
+curl http://localhost:3001/health
+# → {"status":"healthy","toolCount":420,"activeSessions":0,"uptime":60}
 ```
 
 ### 5. Configure VS Code
@@ -214,37 +224,62 @@ Add to your `.vscode/mcp.json`:
 {
   "servers": {
     "dmcp": {
-      "command": "node",
-      "args": [
-        "/path/to/dmcp/server/dist/dmcp-server.js"
-      ],
-      "env": {
-        "REDIS_PORT": "6380",
-        "DMCP_TOP_K": "30",
-        "DMCP_MIN_SCORE": "0.25"
-      }
+      "type": "http",
+      "url": "http://localhost:3001/mcp"
     }
   }
 }
 ```
 
+**That's it!** The DMCP server is now available in VS Code / GitHub Copilot with the `search_tools` meta-tool.
+
 ## 🐳 Docker Commands
 
 ```bash
-# Start core infrastructure (Redis + Embedding)
-docker-compose up -d
+# Start full stack (Redis + Embedding + DMCP Server)
+docker compose up -d
+
+# View logs
+docker compose logs -f dmcp-server
 
 # Run one-shot indexing
-docker-compose run --rm indexer
+docker compose run --rm indexer
 
 # Start indexer worker (continuous sync)
-docker-compose --profile worker up -d
+docker compose --profile worker up -d
 
 # View worker logs
-docker-compose logs -f indexer-worker
+docker compose logs -f indexer-worker
+
+# Rebuild after code changes
+docker compose build dmcp-server
+docker compose up -d dmcp-server
 
 # Stop everything
-docker-compose --profile worker down
+docker compose down
+
+# Stop everything including volumes (⚠️ deletes indexed data)
+docker compose down -v
+```
+
+## 🔧 Local Development
+
+For developing the server or indexer locally:
+
+```bash
+# Start only infrastructure (Redis + Embedding)
+docker compose up -d redis-vss embedding-service
+
+# Build and run server locally
+cd server
+npm install
+npm run build
+REDIS_PORT=6380 npm run start
+
+# Or run indexer locally
+cd indexer
+npm install
+REDIS_PORT=6380 EMBEDDING_URL=http://localhost:5000 npm run index
 ```
 
 ## 🔍 How Search Works
@@ -270,21 +305,71 @@ Example queries and what they find:
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `MCP_GATEWAY_URL` | http://127.0.0.1:15000/config_dump | Agent Gateway config endpoint (indexer) |
+| `PORT` | 3000 | DMCP server port (inside container) |
+| `MCP_GATEWAY_URL` | http://host.docker.internal:15000/config_dump | Agent Gateway config endpoint |
 | `REDIS_HOST` | localhost | Redis server host |
-| `REDIS_PORT` | 6380 | Redis server port |
+| `REDIS_PORT` | 6379 | Redis server port |
 | `EMBEDDING_URL` | http://localhost:5000 | Embedding service URL |
 | `EMBEDDING_MODEL` | mangopy/ToolRet-trained-e5-large-v2 | ToolRet model (1024 dims) |
-| `DMCP_TOP_K` | 30 | Max tools returned per search |
-| `DMCP_MIN_SCORE` | 0.25 | Minimum similarity threshold |
+| `DMCP_TOP_K` | 15 | Max tools returned per search |
+| `DMCP_MIN_SCORE` | 0.3 | Minimum similarity threshold |
 | `SYNC_INTERVAL` | 60 | Worker mode sync interval (seconds) |
+
+### Docker Compose Services
+
+| Service | Container Name | Host Port | Description |
+|---------|----------------|-----------|-------------|
+| `redis-vss` | mcp-redis-vss | 6380 | Redis Stack with vector search |
+| `embedding-service` | mcp-embedding-infinity | 5000 | Infinity embedding service |
+| `dmcp-server` | dmcp-server | 3001 | DMCP MCP server (HTTP) |
+| `indexer` | dmcp-indexer | - | One-shot indexer (manual) |
+| `indexer-worker` | dmcp-indexer-worker | - | Continuous sync worker |
+
+### VS Code MCP Configuration
+
+The server uses **Streamable HTTP transport**, configure in `.vscode/mcp.json`:
+
+```json
+{
+  "servers": {
+    "dmcp": {
+      "type": "http",
+      "url": "http://localhost:3001/mcp"
+    }
+  }
+}
+```
+
+### Health & Monitoring
+
+```bash
+# Check server health
+curl http://localhost:3001/health
+# → {"status":"healthy","toolCount":420,"activeSessions":1,"uptime":3600}
+
+# View server logs
+docker compose logs -f dmcp-server
+
+# Example log output:
+# 16:38:36 [DMCP] ═══════════════════════════════════════
+# 16:38:36 [DMCP] 🚀 Server listening on http://0.0.0.0:3000
+# 16:38:36 [DMCP] ✓ Found 420 indexed tools
+# 16:38:52 [DMCP] POST /mcp [initialize]
+# 16:38:52 [DMCP] 📡 New connection request (will be session #1)
+# 16:39:01 [DMCP] 🔍 Search: "kubernetes pods" (limit: 15)
+# 16:39:01 [DMCP] ✓ Found 12 tools in 45ms
+```
 
 ### Indexer CLI
 
 ```bash
-cd indexer
+# Using Docker (recommended)
+docker compose run --rm indexer                    # Index all tools
+docker compose run --rm indexer -- -f              # Force re-index
+docker compose run --rm indexer -- -s github       # Index specific server
 
-# Manual mode (run once)
+# Or locally
+cd indexer
 npm run index             # Index all tools from gateway
 npm run index:force       # Force re-index (clear existing)
 npm run index -- -s name  # Index only specific server
@@ -296,17 +381,46 @@ npm run worker -- -i 30   # Sync every 30s
 
 ## 🖥️ Server Deployment
 
-For deploying to your own server:
+### Docker Compose (Recommended)
 
-1. **Copy your private configs** to `gateway/config_parts/` on your server
-2. **Generate gateway config**: `cat gateway/config_parts/*.yaml > gateway/config.yaml`
-3. **Start services**: `docker-compose up -d`
-4. **Start gateway**: `cd gateway && ./start.sh`
-5. **Index tools**: `cd indexer && npm run index`
-6. **Start worker** (optional): `cd indexer && npm run worker` (keeps index in sync)
-7. **Build server**: `cd server && npm run build`
+The simplest way to deploy - everything runs in containers:
 
-For Apple Silicon (M1/M2/M3), uncomment the `platform: linux/arm64` line in `docker-compose.yml`.
+```bash
+# 1. Clone and configure
+git clone https://github.com/yourusername/dmcp.git
+cd dmcp
+
+# 2. Set up Agent Gateway with your MCP server configs
+cd gateway
+cat config_parts/*.yaml > config.yaml
+./start.sh
+
+# 3. Start DMCP stack
+cd ..
+docker compose up -d
+
+# 4. Index tools
+docker compose run --rm indexer
+
+# 5. (Optional) Start continuous sync worker
+docker compose --profile worker up -d
+```
+
+### Production Considerations
+
+- **Apple Silicon (M1/M2/M3)**: The embedding service image is `linux/amd64` - Docker will emulate it automatically
+- **Persistence**: Redis data is stored in a Docker volume (`redis-vss-data`)
+- **Resource limits**: Embedding service needs ~6GB RAM, Redis needs ~2GB
+- **Re-indexing**: Run `docker compose run --rm indexer` whenever you add/remove MCP servers
+
+### Endpoint Reference
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/mcp` | POST | MCP JSON-RPC requests |
+| `/mcp` | GET | SSE stream for async notifications |
+| `/mcp` | DELETE | Terminate session |
+| `/health` | GET | Health check with tool count |
 
 ## 📊 Performance
 
@@ -320,11 +434,14 @@ For Apple Silicon (M1/M2/M3), uncomment the `platform: linux/arm64` line in `doc
 
 ## 📐 MCP Spec Compliance
 
-Implements [MCP Tool Discovery](https://modelcontextprotocol.io/specification/2025-06-18/server/tools):
+Implements [MCP Tool Discovery](https://modelcontextprotocol.io/specification/2025-06-18/server/tools) with [Streamable HTTP Transport](https://modelcontextprotocol.io/specification/2025-03-26/basic/transports#streamable-http):
 
 - ✅ `listChanged: true` capability
 - ✅ `notifications/tools/list_changed` notifications
 - ✅ Dynamic tool availability based on search
+- ✅ Streamable HTTP transport (POST/GET/DELETE on `/mcp`)
+- ✅ Session management with UUID session IDs
+- ✅ SSE for async server-to-client notifications
 
 ## 📄 License
 
