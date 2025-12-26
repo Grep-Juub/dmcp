@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 /**
- * DMCP Server - Dynamic Model Context Protocol Runtime
+ * DMCP Server - Dynamic Model Context Protocol Runtime (Streamable HTTP)
  * 
  * Lightweight MCP server for query-driven tool discovery.
  * Assumes tools are already indexed in Redis (use dmcp-indexer first).
@@ -11,22 +11,24 @@
  * - Connects to backend SSE servers LAZILY (on first tool call)
  * - Dynamic tool list based on semantic search
  * - Sends listChanged notifications when tools update
+ * - Streamable HTTP transport for use with docker-compose
  * 
  * Usage:
  *   npm run start                    # Start server
- *   npm run start -- /path/to/config # Custom config path
+ *   PORT=3000 npm run start          # Custom port
  */
 
-import { Server } from '@modelcontextprotocol/sdk/server/index.js';
-import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
-import {
-  CallToolRequestSchema,
-  ListToolsRequestSchema,
-  Tool,
-} from '@modelcontextprotocol/sdk/types.js';
-import { Client } from '@modelcontextprotocol/sdk/client/index.js';
+import { randomUUID } from 'node:crypto';
+import express, { Request, Response } from 'express';
+import { z } from 'zod';
+import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
+import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { SSEClientTransport } from '@modelcontextprotocol/sdk/client/sse.js';
+import { Client } from '@modelcontextprotocol/sdk/client/index.js';
+import { isInitializeRequest, Tool, CallToolResult } from '@modelcontextprotocol/sdk/types.js';
 import { RedisVSS, FilteredTool } from './redis-vss.js';
+
+const PORT = parseInt(process.env.PORT || '3000');
 
 /**
  * Sanitize tool names to conform to MCP naming requirements [a-z0-9_-]
@@ -35,491 +37,571 @@ function sanitizeToolName(name: string): string {
   return name.replace(/[^a-z0-9_-]/gi, '_').toLowerCase();
 }
 
+// ============================================================================
+// Server State (shared across sessions in stateless mode)
+// ============================================================================
+
+// Redis connection for tool search
+const redis = new RedisVSS({
+  host: process.env.REDIS_HOST || 'localhost',
+  port: parseInt(process.env.REDIS_PORT || '6379'),
+  password: process.env.REDIS_PASSWORD,
+  embeddingDimensions: 384,
+  embeddingURL: process.env.EMBEDDING_URL || 'http://localhost:5000',
+});
+
+// Configuration
+const topK = parseInt(process.env.DMCP_TOP_K || '15');
+const minScore = parseFloat(process.env.DMCP_MIN_SCORE || '0.3');
+
+// Tool tracking (shared across sessions)
+let totalToolCount = 0;
+const toolServerUrls = new Map<string, string>();  // toolKey -> serverUrl
+const serverClients = new Map<string, Client>();   // serverId -> Client
+
+// Initialization state
+let isInitialized = false;
+let initializationError: Error | null = null;
+let initPromise: Promise<void> | null = null;
+
+// ============================================================================
+// Helper Functions
+// ============================================================================
+
 /**
- * DMCP Server - Runtime for dynamic tool discovery
- * 
- * LAZY ARCHITECTURE:
- * - Only connects to Redis at startup (fast!)
- * - Backend MCP servers are connected ON-DEMAND when a tool is called
- * - Tool metadata comes from Redis, not from querying backends
+ * Get the search_tools meta-tool definition
  */
-class DMCPServer {
-  private server: Server;
-  private redis: RedisVSS;
+function getSearchToolDefinition(): Tool {
+  const description = [
+    `Search for relevant tools based on your task.`,
+    `This server has ${totalToolCount} tools indexed across multiple services`,
+    `(GitHub, Google Workspace, AWS, Kubernetes, Datadog, Grafana, Jira, etc.).`,
+    `Use this tool FIRST to discover which tools are available for your specific task.`,
+    `Returns the top ${topK} most relevant tools.`,
+  ].join(' ');
   
-  // Currently exposed tools (dynamic subset)
-  private exposedTools: Map<string, Tool> = new Map();
-  
-  // Always-exposed meta tools (LLM enhancement)
-  private metaTools: Map<string, Tool> = new Map();
-  
-  // Map toolKey -> serverUrl for direct connection
-  private toolServerUrls: Map<string, string> = new Map();
-  
-  // Tool usage tracking for eviction
-  private toolLastUsed: Map<string, number> = new Map();  // toolKey -> request counter
-  private requestCounter = 0;
-  private readonly EVICTION_THRESHOLD = 5;  // Remove tools not used in N requests
-  
-  // Lazy connection pool for backend servers
-  private serverClients: Map<string, Client> = new Map();
-  
-  // Configuration
-  private topK: number;
-  private minScore: number;
-  
-  // State
-  private initializationPromise: Promise<void> | null = null;
-  private isInitialized = false;
-  private initializationError: Error | null = null;
-  private totalToolCount = 0;
-
-  constructor() {
-    this.topK = parseInt(process.env.DMCP_TOP_K || '15');
-    this.minScore = parseFloat(process.env.DMCP_MIN_SCORE || '0.3');
-    
-    this.server = new Server(
-      {
-        name: 'dmcp-server',
-        version: '1.0.0',
-      },
-      {
-        capabilities: {
-          tools: {
-            listChanged: true,  // We send notifications when tools change
-          },
+  return {
+    name: 'search_tools',
+    description,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        query: {
+          type: 'string',
+          description: `Describe what you want to do. Examples: "create a GitHub issue", "search emails", "check Kubernetes pod status", "query AWS costs"`,
         },
-      }
+        limit: {
+          type: 'number',
+          description: `Maximum number of tools to return (default: ${topK}, max: 50)`,
+        },
+      },
+      required: ['query'],
+    },
+  };
+}
+
+/**
+ * Rewrite localhost URLs to host.docker.internal when running in Docker
+ */
+function rewriteUrlForDocker(url: string): string {
+  // Check if we're in Docker (REDIS_HOST would be set to container name)
+  const inDocker = process.env.REDIS_HOST && !process.env.REDIS_HOST.includes('localhost');
+  if (!inDocker) return url;
+  
+  // Replace localhost/127.0.0.1 with host.docker.internal
+  return url
+    .replace(/localhost/g, 'host.docker.internal')
+    .replace(/127\.0\.0\.1/g, 'host.docker.internal');
+}
+
+/**
+ * Connect to an SSE MCP Server (lazy - on demand)
+ */
+async function connectToBackend(serverId: string, url: string): Promise<Client | null> {
+  const rewrittenUrl = rewriteUrlForDocker(url);
+  try {
+    console.error(`${timestamp()} [DMCP] 🔗 Connecting to ${serverId} at ${rewrittenUrl}...`);
+    const transport = new SSEClientTransport(new URL(rewrittenUrl));
+    const client = new Client(
+      { name: 'dmcp-client', version: '1.0.0' },
+      { capabilities: {} }
     );
-
-    this.redis = new RedisVSS({
-      host: process.env.REDIS_HOST || 'localhost',
-      port: parseInt(process.env.REDIS_PORT || '6380'),
-      password: process.env.REDIS_PASSWORD,
-      embeddingDimensions: 384,
-    });
-
-    this.setupHandlers();
-  }
-
-  /**
-   * The search_tools meta-tool definition
-   * 
-   * Based on Anthropic's official Tool Search Tool pattern:
-   * https://github.com/anthropics/claude-cookbooks/blob/main/tool_use/tool_search_with_embeddings.ipynb
-   * 
-   * Key principle: Generic, action-oriented description that tells the LLM
-   * "use this when you need a tool but don't have it available yet"
-   */
-  private getSearchToolDefinition(): Tool {
-    // More assertive description that competes with built-in tools
-    // Key: Make it clear this provides BETTER/MORE capabilities than defaults
-    const description = [
-      `Search for relevant tools based on your task.`,
-      `This server has ${this.totalToolCount} tools indexed across multiple services`,
-      `(GitHub, Google Workspace, AWS, Kubernetes, Datadog, Grafana, Jira, etc.).`,
-      `Use this tool FIRST to discover which tools are available for your specific task.`,
-      `Returns the top ${this.topK} most relevant tools.`,
-    ].join(' ');
-    
-    return {
-      name: 'mcp_dmcp_search_tools',
-      description,
-      inputSchema: {
-        type: 'object',
-        properties: {
-          query: {
-            type: 'string',
-            description: `Describe what you want to do. Examples: "create a GitHub issue", "search emails", "check Kubernetes pod status", "query AWS costs"`,
-          },
-          limit: {
-            type: 'number',
-            description: `Maximum number of tools to return (default: ${this.topK}, max: 50)`,
-          },
-        },
-        required: ['query'],
-      },
-    };
-  }
-
-  /**
-   * Notify clients that the tool list has changed
-   */
-  private notifyToolsChanged() {
-    try {
-      this.server.notification({
-        method: 'notifications/tools/list_changed',
-        params: {},
-      });
-      console.error(`[DMCP] Sent tools/list_changed notification (${this.exposedTools.size} tools now exposed)`);
-    } catch (error) {
-      console.error('[DMCP] Failed to send notification:', error);
-    }
-  }
-
-  /**
-   * Update exposed tools based on search results
-   * Merges new tools with recently-used tools and evicts stale ones
-   * Always includes meta tools (LLM enhancement)
-   */
-  private updateExposedTools(filteredTools: FilteredTool[]) {
-    const newExposed = new Map<string, Tool>();
-    
-    // Always include the search meta-tool
-    newExposed.set('mcp_dmcp_search_tools', this.getSearchToolDefinition());
-    
-    // Always include meta tools (LLM enhancement - sequential-thinking, etc.)
-    for (const [toolKey, tool] of this.metaTools) {
-      newExposed.set(toolKey, tool);
-    }
-    
-    // Add new filtered tools from search
-    for (const tool of filteredTools) {
-      const toolKey = sanitizeToolName(`${tool.serverId}_${tool.name}`);
-      newExposed.set(toolKey, {
-        name: toolKey,
-        description: `[${tool.serverId}] ${tool.description}`,
-        inputSchema: tool.inputSchema || { type: 'object', properties: {} },
-      });
-      
-      if (tool.serverUrl) {
-        this.toolServerUrls.set(toolKey, tool.serverUrl);
-      }
-      
-      // Mark as fresh (will be kept)
-      this.toolLastUsed.set(toolKey, this.requestCounter);
-    }
-    
-    // Keep recently-used tools that aren't in the new search results
-    for (const [toolKey, tool] of this.exposedTools) {
-      if (toolKey === 'mcp_dmcp_search_tools') continue;
-      if (this.metaTools.has(toolKey)) continue;  // Skip meta tools (always kept)
-      if (newExposed.has(toolKey)) continue;
-      
-      const lastUsed = this.toolLastUsed.get(toolKey) || 0;
-      const age = this.requestCounter - lastUsed;
-      
-      if (age < this.EVICTION_THRESHOLD) {
-        // Keep this tool - it was used recently
-        newExposed.set(toolKey, tool);
-      } else {
-        // Evict this stale tool
-        this.toolLastUsed.delete(toolKey);
-        console.error(`[DMCP] Evicted stale tool: ${toolKey} (unused for ${age} requests)`);
-      }
-    }
-    
-    // Check if tools actually changed
-    const oldKeys = new Set(this.exposedTools.keys());
-    const newKeys = new Set(newExposed.keys());
-    
-    const changed = oldKeys.size !== newKeys.size || 
-      [...oldKeys].some(k => !newKeys.has(k)) ||
-      [...newKeys].some(k => !oldKeys.has(k));
-    
-    if (changed) {
-      this.exposedTools = newExposed;
-      this.notifyToolsChanged();
-    }
-  }
-
-  /**
-   * Connect to an SSE MCP Server (lazy - on demand)
-   */
-  private async connectToSSEServer(serverId: string, url: string): Promise<Client | null> {
-    try {
-      console.error(`[DMCP] Lazy connecting to ${serverId}...`);
-      const transport = new SSEClientTransport(new URL(url));
-      const client = new Client(
-        { name: 'dmcp-client', version: '1.0.0' },
-        { capabilities: {} }
-      );
-      await client.connect(transport);
-      console.error(`[DMCP] ✓ Connected to ${serverId}`);
-      return client;
-    } catch (error) {
-      console.error(`[DMCP] Failed to connect to ${serverId}:`, (error as Error).message);
-      return null;
-    }
-  }
-
-  /**
-   * Get or create a client connection to a backend server (lazy)
-   */
-  private async getServerClient(serverId: string, serverUrl?: string): Promise<Client | null> {
-    // Return existing connection
-    if (this.serverClients.has(serverId)) {
-      return this.serverClients.get(serverId)!;
-    }
-
-    // Lazy connect
-    if (!serverUrl) {
-      console.error(`[DMCP] No server URL provided for: ${serverId}`);
-      return null;
-    }
-
-    const client = await this.connectToSSEServer(serverId, serverUrl);
-    if (client) {
-      this.serverClients.set(serverId, client);
-    }
+    await client.connect(transport);
+    console.error(`${timestamp()} [DMCP] ✓ Connected to ${serverId}`);
     return client;
+  } catch (error) {
+    console.error(`${timestamp()} [DMCP] ✗ Failed to connect to ${serverId} (${rewrittenUrl}): ${(error as Error).message}`);
+    return null;
   }
+}
 
-  /**
-   * Setup MCP protocol handlers
-   */
-  private setupHandlers() {
-    // List currently exposed tools
-    this.server.setRequestHandler(ListToolsRequestSchema, async () => {
-      await this.waitForInit();
-      console.error(`[DMCP] tools/list - returning ${this.exposedTools.size} tools`);
-      return { tools: Array.from(this.exposedTools.values()) };
-    });
-
-    // Handle tool calls
-    this.server.setRequestHandler(CallToolRequestSchema, async (request) => {
-      await this.waitForInit();
-
-      const toolName = request.params.name;
-      const args = request.params.arguments || {};
-
-      console.error(`[DMCP] Tool call: ${toolName}`);
-
-      // Handle the search_tools meta-tool
-      if (toolName === 'mcp_dmcp_search_tools') {
-        return this.handleSearchTools(args);
-      }
-
-      // Forward to backend MCP server
-      return this.forwardToolCall(toolName, args);
-    });
+/**
+ * Get or create a client connection to a backend server (lazy)
+ */
+async function getServerClient(serverId: string, serverUrl?: string): Promise<Client | null> {
+  if (serverClients.has(serverId)) {
+    console.error(`${timestamp()} [DMCP] ↩ Reusing connection to ${serverId}`);
+    return serverClients.get(serverId)!;
   }
-
-  /**
-   * Parse query to detect CRUD intent for smarter filtering
-   * Returns intent type: 'read', 'create', 'update', 'delete', or null (no specific intent)
-   */
-  private parseQueryIntent(query: string): 'read' | 'create' | 'update' | 'delete' | null {
-    const q = query.toLowerCase();
-    
-    // Read intent
-    if (/\b(get|read|fetch|list|search|find|show|view|query|check|retrieve)\b/.test(q)) {
-      return 'read';
-    }
-    // Create intent
-    if (/\b(create|add|new|post|insert|make|write)\b/.test(q)) {
-      return 'create';
-    }
-    // Update intent
-    if (/\b(update|edit|modify|change|patch|put|set|assign)\b/.test(q)) {
-      return 'update';
-    }
-    // Delete intent
-    if (/\b(delete|remove|drop|destroy|clear|unset)\b/.test(q)) {
-      return 'delete';
-    }
-    
+  if (!serverUrl) {
+    console.error(`${timestamp()} [DMCP] ✗ No server URL for: ${serverId}`);
     return null;
   }
 
-  /**
-   * Filter tools by intent (CRUD operation matching)
-   */
-  private filterByIntent(tools: FilteredTool[], intent: 'read' | 'create' | 'update' | 'delete'): FilteredTool[] {
-    const patterns: Record<string, RegExp> = {
-      read: /\b(get|read|list|search|find|query|fetch|retrieve|show)\b/i,
-      create: /\b(create|add|post|insert|new|write)\b/i,
-      update: /\b(update|edit|put|patch|modify|set|assign)\b/i,
-      delete: /\b(delete|remove|drop|destroy|clear)\b/i,
-    };
-    
-    const pattern = patterns[intent];
-    
-    // Filter to tools matching the intent
-    const matching = tools.filter(t => {
-      const text = `${t.name} ${t.description}`.toLowerCase();
-      return pattern.test(text);
-    });
-    
-    // If we found matching tools, return them; otherwise return all (fallback)
-    return matching.length > 0 ? matching : tools;
+  const client = await connectToBackend(serverId, serverUrl);
+  if (client) {
+    serverClients.set(serverId, client);
   }
+  return client;
+}
 
-  /**
-   * Handle the search_tools meta-tool with smart routing
-   */
-  private async handleSearchTools(args: Record<string, unknown>): Promise<{ content: Array<{ type: string; text: string }> }> {
-    const query = args.query as string;
-    const limit = Math.min(args.limit as number || this.topK, 50);
+/**
+ * Parse tool name to extract serverId and original name
+ */
+function parseToolName(toolName: string, description?: string): { serverId: string; originalName: string } | null {
+  // Description format: [serverId] actual description
+  const match = description?.match(/^\[([^\]]+)\]/);
+  if (!match) return null;
 
-    console.error(`[DMCP] Searching: "${query}" (limit: ${limit})`);
+  const serverId = match[1];
+  const prefix = sanitizeToolName(serverId) + '_';
+  if (!toolName.startsWith(prefix)) return null;
+  
+  const originalName = toolName.slice(prefix.length);
+  return { serverId, originalName };
+}
 
-    // Detect intent from query
-    const intent = this.parseQueryIntent(query);
-    if (intent) {
-      console.error(`[DMCP] Detected intent: ${intent}`);
+/**
+ * Initialize Redis connection (background)
+ */
+async function initialize(): Promise<void> {
+  try {
+    console.error(`${timestamp()} [DMCP] Connecting to Redis...`);
+    await redis.connect();
+    
+    totalToolCount = await redis.getToolCount();
+    
+    if (totalToolCount === 0) {
+      console.error(`${timestamp()} [DMCP] ⚠️  No tools indexed in Redis!`);
+      console.error(`${timestamp()} [DMCP] Run indexer first to populate tools.`);
+    } else {
+      console.error(`${timestamp()} [DMCP] ✓ Found ${totalToolCount} indexed tools`);
     }
 
-    // Get more candidates from Redis for routing
-    const rawTools = await this.redis.search(query, {
-      topK: limit * 3,  // Get more candidates for routing/dedup
-      minScore: this.minScore,
-    });
-
-    console.error(`[DMCP] Found ${rawTools.length} candidate tools from Redis`);
-
-    // NO FILTERING - Trust the vector embeddings completely
-    // The ToolRet model is specifically trained for tool selection
-    const finalTools = rawTools.slice(0, limit);
-
-    // Update exposed tools and notify
-    this.updateExposedTools(finalTools);
-
-    // Return formatted results - simple and clean
-    const toolList = finalTools.map((t, i) => {
-      const toolKey = sanitizeToolName(`${t.serverId}_${t.name}`);
-      const domainInfo = t.domain ? ` [${t.domain}]` : '';
-      return `${i + 1}. **${toolKey}**${domainInfo} (score: ${t.score.toFixed(2)})\n   ${t.description}`;
-    }).join('\n\n');
-
-    const response = `Found ${finalTools.length} relevant tools for "${query}":\n\n${toolList}\n\nThese tools are now available. You can call them directly by name.`;
-
-    return {
-      content: [{ type: 'text', text: response }],
-    };
+    isInitialized = true;
+    console.error(`${timestamp()} [DMCP] ✓ Ready - ${totalToolCount} tools searchable`);
+  } catch (error) {
+    console.error(`${timestamp()} [DMCP] ✗ Initialization error: ${(error as Error).message}`);
+    initializationError = error as Error;
   }
+}
 
-  /**
-   * Parse tool name to extract serverId and original name
-   * Format: serverId_originalName (sanitized)
-   */
-  private parseToolName(toolName: string): { serverId: string; originalName: string } | null {
-    // Tool names are formatted as: serverId_originalToolName (all lowercase, sanitized)
-    // We need to find the server from the exposed tools map
-    const tool = this.exposedTools.get(toolName);
-    if (!tool) return null;
-
-    // Extract serverId from the description which has format: [serverId] description
-    const match = tool.description?.match(/^\[([^\]]+)\]/);
-    if (!match) return null;
-
-    const serverId = match[1];
-    // Original name is toolName with serverId prefix removed
-    const prefix = sanitizeToolName(serverId) + '_';
-    if (!toolName.startsWith(prefix)) return null;
-    
-    const originalName = toolName.slice(prefix.length);
-    return { serverId, originalName };
+/**
+ * Wait for initialization
+ */
+async function waitForInit(): Promise<void> {
+  if (initPromise && !isInitialized) {
+    await initPromise;
   }
+  if (initializationError) {
+    throw new Error(`Initialization failed: ${initializationError.message}`);
+  }
+}
 
-  /**
-   * Forward tool call to backend MCP server (lazy connection)
-   */
-  private async forwardToolCall(toolName: string, args: Record<string, unknown>): Promise<{ content: Array<{ type: string; text: string }> }> {
-    // Increment request counter on each tool call
-    this.requestCounter++;
-    
-    const parsed = this.parseToolName(toolName);
-    if (!parsed) {
+// ============================================================================
+// MCP Server Factory
+// ============================================================================
+
+/**
+ * Create a new MCP server instance for each session
+ */
+function createServer(): McpServer {
+  const server = new McpServer(
+    {
+      name: 'dmcp-server',
+      version: '3.0.0',
+    },
+    {
+      capabilities: {
+        tools: {},
+      },
+    }
+  );
+
+  // Per-session tool state
+  const exposedTools = new Map<string, { tool: Tool; serverUrl?: string }>();
+
+  // Helper function to handle dynamic tool calls
+  const handleDynamicToolCall = async (toolName: string, args: Record<string, unknown>): Promise<CallToolResult> => {
+    console.error(`${timestamp()} [DMCP] 🔧 Tool call: ${toolName}`);
+
+    // Check if we have this tool exposed
+    const toolInfo = exposedTools.get(toolName);
+    if (!toolInfo) {
+      console.error(`${timestamp()} [DMCP] ✗ Tool not available: ${toolName}`);
       return {
         content: [{
           type: 'text',
-          text: `Tool "${toolName}" is not currently available. Use "mcp_dmcp_search_tools" first to discover relevant tools for your task.`,
+          text: `Tool "${toolName}" not available. Use "search_tools" first to discover tools.`,
         }],
+        isError: true,
+      };
+    }
+
+    // Parse tool name to get serverId
+    const parsed = parseToolName(toolName, toolInfo.tool.description);
+    if (!parsed) {
+      console.error(`${timestamp()} [DMCP] ✗ Invalid tool format: ${toolName}`);
+      return {
+        content: [{
+          type: 'text',
+          text: `Invalid tool format: ${toolName}`,
+        }],
+        isError: true,
       };
     }
 
     const { serverId, originalName } = parsed;
-    
-    // Mark tool as used (prevents eviction)
-    this.toolLastUsed.set(toolName, this.requestCounter);
 
-    // Get server URL from our map
-    const serverUrl = this.toolServerUrls.get(toolName);
-
-    // Lazy connect to backend server
-    const client = await this.getServerClient(serverId, serverUrl);
+    // Get backend client (lazy connect)
+    const client = await getServerClient(serverId, toolInfo.serverUrl);
     if (!client) {
-      throw new Error(`Cannot connect to server: ${serverId} (URL: ${serverUrl || 'unknown'})`);
+      console.error(`${timestamp()} [DMCP] ✗ Cannot connect to ${serverId}`);
+      return {
+        content: [{
+          type: 'text',
+          text: `Cannot connect to backend: ${serverId}. The MCP server may not be running.`,
+        }],
+        isError: true,
+      };
     }
 
-    console.error(`[DMCP] Forwarding to ${serverId}: ${originalName}`);
+    const argsStr = JSON.stringify(args);
+    console.error(`${timestamp()} [DMCP] → ${serverId}::${originalName}`);
+    console.error(`${timestamp()} [DMCP]   Args: ${argsStr.slice(0, 300)}${argsStr.length > 300 ? '...' : ''}`);
     
-    const result = await client.callTool({
-      name: originalName,
-      arguments: args,
-    });
-
-    return result as { content: Array<{ type: string; text: string }> };
-  }
-
-  /**
-   * Wait for initialization to complete
-   */
-  private async waitForInit(): Promise<void> {
-    if (this.initializationPromise && !this.isInitialized) {
-      await this.initializationPromise;
-    }
-    if (this.initializationError) {
-      throw new Error(`Initialization failed: ${this.initializationError.message}`);
-    }
-  }
-
-  /**
-   * Start the DMCP server
-   */
-  async start() {
+    const startTime = Date.now();
     try {
-      // Initialize with search meta-tool
-      this.exposedTools.set('mcp_dmcp_search_tools', this.getSearchToolDefinition());
-      
-      // Connect MCP server immediately (fast startup)
-      const transport = new StdioServerTransport();
-      await this.server.connect(transport);
-      console.error('[DMCP] Server connected via stdio');
-
-      // Background initialization
-      this.initializationPromise = this.initializeInBackground();
+      const result = await client.callTool({
+        name: originalName,
+        arguments: args,
+      });
+      const duration = Date.now() - startTime;
+      console.error(`${timestamp()} [DMCP] ✓ ${originalName} completed in ${duration}ms`);
+      return result as CallToolResult;
     } catch (error) {
-      console.error('[DMCP] Fatal error:', error);
-      process.exit(1);
+      const duration = Date.now() - startTime;
+      console.error(`${timestamp()} [DMCP] ✗ ${originalName} failed after ${duration}ms: ${(error as Error).message}`);
+      return {
+        content: [{
+          type: 'text',
+          text: `Error calling ${originalName}: ${(error as Error).message}`,
+        }],
+        isError: true,
+      };
     }
-  }
+  };
+  
+  // Register the search_tools meta-tool
+  server.registerTool(
+    'search_tools',
+    {
+      description: getSearchToolDefinition().description,
+      inputSchema: {
+        query: z.string().describe('Describe what you want to do'),
+        limit: z.number().optional().describe(`Maximum tools to return (default: ${topK}, max: 50)`),
+      },
+    },
+    async ({ query, limit }): Promise<CallToolResult> => {
+      await waitForInit();
+      
+      const effectiveLimit = Math.min(limit || topK, 50);
+      console.error(`${timestamp()} [DMCP] 🔍 Search: "${query}" (limit: ${effectiveLimit})`);
+      const startTime = Date.now();
 
-  /**
-   * Background initialization - LAZY: only connects to Redis, not to backends
-   * Backend connections are made on-demand when tools are called
-   */
-  private async initializeInBackground(): Promise<void> {
-    try {
-      // Connect to Redis (read-only for searching)
-      console.error('[DMCP] Connecting to Redis...');
-      await this.redis.connect();
-      
-      // Get tool count from existing index
-      this.totalToolCount = await this.redis.getToolCount();
-      
-      if (this.totalToolCount === 0) {
-        console.error('[DMCP] ⚠️  No tools indexed in Redis!');
-        console.error('[DMCP] Run "npm run index" first to index tools.');
-      } else {
-        console.error(`[DMCP] ✓ Found ${this.totalToolCount} indexed tools`);
+      const tools = await redis.search(query, {
+        topK: effectiveLimit,
+        minScore,
+      });
+
+      const duration = Date.now() - startTime;
+      console.error(`${timestamp()} [DMCP] ✓ Found ${tools.length} tools in ${duration}ms`);
+      if (tools.length > 0) {
+        console.error(`${timestamp()} [DMCP]   Top: ${tools.slice(0, 3).map(t => `${t.serverId}/${t.name}(${t.score.toFixed(2)})`).join(', ')}`);
       }
 
-      // Meta tools are handled through regular search - no special loading needed
+      // Store tools and dynamically register them
+      let newlyRegistered = 0;
+      for (const tool of tools) {
+        const toolKey = sanitizeToolName(`${tool.serverId}_${tool.name}`);
+        
+        // Skip if already registered
+        if (exposedTools.has(toolKey)) continue;
+        
+        newlyRegistered++;
+        exposedTools.set(toolKey, {
+          tool: {
+            name: toolKey,
+            description: `[${tool.serverId}] ${tool.description}`,
+            inputSchema: tool.inputSchema || { type: 'object', properties: {} },
+          },
+          serverUrl: tool.serverUrl,
+        });
+        if (tool.serverUrl) {
+          toolServerUrls.set(toolKey, tool.serverUrl);
+        }
 
-      // Update search tool description with actual count
-      this.exposedTools.set('mcp_dmcp_search_tools', this.getSearchToolDefinition());
+        // Dynamically register the tool
+        // Using the generic z.record for arbitrary input schemas
+        server.registerTool(
+          toolKey,
+          {
+            description: `[${tool.serverId}] ${tool.description}`,
+            inputSchema: z.record(z.unknown()).optional(),
+          },
+          async (args): Promise<CallToolResult> => {
+            return handleDynamicToolCall(toolKey, args as Record<string, unknown>);
+          }
+        );
+      }
       
-      this.isInitialized = true;
-      console.error(`[DMCP] ✓ Ready - ${this.totalToolCount} tools searchable, backends connect on-demand`);
-    } catch (error) {
-      console.error('[DMCP] Initialization error:', error);
-      this.initializationError = error as Error;
+      if (newlyRegistered > 0) {
+        console.error(`${timestamp()} [DMCP]   📝 Registered ${newlyRegistered} new tools (session total: ${exposedTools.size})`);
+      } else {
+        console.error(`${timestamp()} [DMCP]   ↩ All ${tools.length} tools already registered`);
+      }
+
+      // Format response
+      const toolList = tools.map((t, i) => {
+        const toolKey = sanitizeToolName(`${t.serverId}_${t.name}`);
+        return `${i + 1}. **${toolKey}** (score: ${t.score.toFixed(2)})\n   ${t.description}`;
+      }).join('\n\n');
+
+      return {
+        content: [{
+          type: 'text',
+          text: `Found ${tools.length} relevant tools for "${query}":\n\n${toolList}\n\nThese tools are now available. Call them by name.`,
+        }],
+      };
     }
-  }
+  );
+
+  return server;
 }
 
-// Start the server
-console.error(`[DMCP] Starting server (using Redis for configuration)`);
-new DMCPServer().start();
+// ============================================================================
+// Express Application
+// ============================================================================
+
+const app = express();
+app.use(express.json());
+
+// Store transports by session ID
+const transports: Record<string, StreamableHTTPServerTransport> = {};
+
+// Track active sessions for logging
+let sessionCounter = 0;
+const sessionInfo: Record<string, { id: number; createdAt: Date; requestCount: number }> = {};
+
+/**
+ * Format timestamp for logging
+ */
+function timestamp(): string {
+  return new Date().toISOString().split('T')[1].split('.')[0];
+}
+
+/**
+ * Log with timestamp and session context
+ */
+function log(message: string, sessionId?: string): void {
+  const prefix = sessionId && sessionInfo[sessionId] 
+    ? `[DMCP #${sessionInfo[sessionId].id}]`
+    : '[DMCP]';
+  console.error(`${timestamp()} ${prefix} ${message}`);
+}
+
+// Health check endpoint
+app.get('/health', (_req: Request, res: Response) => {
+  const activeSessions = Object.keys(transports).length;
+  res.json({
+    status: isInitialized ? 'healthy' : 'initializing',
+    toolCount: totalToolCount,
+    activeSessions,
+    uptime: Math.floor(process.uptime()),
+    error: initializationError?.message,
+  });
+});
+
+// MCP endpoint - handle POST requests
+app.post('/mcp', async (req: Request, res: Response) => {
+  const sessionId = req.headers['mcp-session-id'] as string | undefined;
+  const method = req.body?.method || 'unknown';
+  
+  if (sessionId && sessionInfo[sessionId]) {
+    sessionInfo[sessionId].requestCount++;
+  }
+  
+  log(`POST /mcp [${method}]`, sessionId);
+  
+  try {
+    let transport: StreamableHTTPServerTransport;
+
+    if (sessionId && transports[sessionId]) {
+      // Reuse existing transport
+      transport = transports[sessionId];
+      log(`  → Using existing session`, sessionId);
+    } else if (!sessionId && isInitializeRequest(req.body)) {
+      // New session - create transport
+      const newSessionNum = ++sessionCounter;
+      log(`📡 New connection request (will be session #${newSessionNum})`);
+      
+      transport = new StreamableHTTPServerTransport({
+        sessionIdGenerator: () => randomUUID(),
+        onsessioninitialized: (sid) => {
+          sessionInfo[sid] = { id: newSessionNum, createdAt: new Date(), requestCount: 1 };
+          transports[sid] = transport;
+          log(`✓ Session initialized: ${sid.slice(0, 8)}...`, sid);
+        },
+      });
+
+      transport.onclose = () => {
+        const sid = transport.sessionId;
+        if (sid) {
+          const info = sessionInfo[sid];
+          if (info) {
+            const duration = Math.floor((Date.now() - info.createdAt.getTime()) / 1000);
+            log(`🔌 Session closed after ${duration}s (${info.requestCount} requests)`, sid);
+            delete sessionInfo[sid];
+          }
+          delete transports[sid];
+        }
+      };
+
+      // Connect transport to a new server instance
+      const server = createServer();
+      await server.connect(transport);
+      log(`✓ Server connected to transport`);
+    } else {
+      // Invalid request
+      log(`⚠️ Bad request: ${sessionId ? 'Invalid session' : 'Missing session for non-init request'}`);
+      res.status(400).json({
+        jsonrpc: '2.0',
+        error: { code: -32000, message: 'Bad Request: No valid session ID' },
+        id: null,
+      });
+      return;
+    }
+
+    await transport.handleRequest(req, res, req.body);
+  } catch (error) {
+    log(`✗ Error handling request: ${(error as Error).message}`, sessionId);
+    if (!res.headersSent) {
+      res.status(500).json({
+        jsonrpc: '2.0',
+        error: { code: -32603, message: 'Internal server error' },
+        id: null,
+      });
+    }
+  }
+});
+
+// Handle GET for SSE streams (async notifications)
+app.get('/mcp', async (req: Request, res: Response) => {
+  const sessionId = req.headers['mcp-session-id'] as string | undefined;
+  
+  log(`GET /mcp (SSE stream request)`, sessionId);
+  
+  if (!sessionId || !transports[sessionId]) {
+    log(`⚠️ SSE rejected: ${sessionId ? 'unknown session' : 'missing session ID'}`);
+    res.status(400).json({
+      jsonrpc: '2.0',
+      error: { code: -32000, message: 'Invalid or missing session ID' },
+      id: null,
+    });
+    return;
+  }
+
+  log(`📺 Opening SSE stream`, sessionId);
+  
+  // Track SSE connection for logging
+  req.on('close', () => {
+    log(`📺 SSE stream closed by client`, sessionId);
+  });
+  
+  req.on('error', (err) => {
+    log(`⚠️ SSE stream error: ${err.message}`, sessionId);
+  });
+
+  const transport = transports[sessionId];
+  await transport.handleRequest(req, res);
+});
+
+// Handle DELETE for session termination
+app.delete('/mcp', async (req: Request, res: Response) => {
+  const sessionId = req.headers['mcp-session-id'] as string | undefined;
+  
+  log(`DELETE /mcp`, sessionId);
+  
+  if (sessionId && transports[sessionId]) {
+    const transport = transports[sessionId];
+    await transport.close();
+    delete transports[sessionId];
+    log(`✓ Session terminated`, sessionId);
+    res.status(200).send();
+  } else {
+    log(`⚠️ Session not found for DELETE`);
+    res.status(404).json({
+      jsonrpc: '2.0',
+      error: { code: -32000, message: 'Session not found' },
+      id: null,
+    });
+  }
+});
+
+// ============================================================================
+// Server Startup
+// ============================================================================
+
+// Start background initialization
+initPromise = initialize();
+
+// Start HTTP server
+app.listen(PORT, '0.0.0.0', () => {
+  console.error(`${timestamp()} [DMCP] ═══════════════════════════════════════`);
+  console.error(`${timestamp()} [DMCP] 🚀 Server listening on http://0.0.0.0:${PORT}`);
+  console.error(`${timestamp()} [DMCP]    MCP endpoint: http://localhost:${PORT}/mcp`);
+  console.error(`${timestamp()} [DMCP]    Health check: http://localhost:${PORT}/health`);
+  console.error(`${timestamp()} [DMCP] ═══════════════════════════════════════`);
+});
+
+// Graceful shutdown
+process.on('SIGINT', async () => {
+  console.error(`${timestamp()} [DMCP] 🛑 Shutting down (SIGINT)...`);
+  
+  const sessionCount = Object.keys(transports).length;
+  if (sessionCount > 0) {
+    console.error(`${timestamp()} [DMCP]    Closing ${sessionCount} active sessions...`);
+  }
+  
+  for (const sessionId of Object.keys(transports)) {
+    try {
+      await transports[sessionId].close();
+    } catch (error) {
+      console.error(`${timestamp()} [DMCP] ✗ Error closing session: ${(error as Error).message}`);
+    }
+  }
+  
+  try {
+    await redis.disconnect();
+    console.error(`${timestamp()} [DMCP] ✓ Redis disconnected`);
+  } catch (error) {
+    console.error(`${timestamp()} [DMCP] ✗ Redis disconnect error: ${(error as Error).message}`);
+  }
+  
+  process.exit(0);
+});
+
+process.on('SIGTERM', async () => {
+  console.error(`${timestamp()} [DMCP] 🛑 Shutting down (SIGTERM)...`);
+  process.exit(0);
+});

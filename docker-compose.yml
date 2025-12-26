@@ -63,6 +63,87 @@ services:
     networks:
       - mcp-network
 
+  # DMCP Indexer Worker - Keeps tool index in sync
+  # Runs continuously and syncs changes from Agent Gateway
+  indexer-worker:
+    build:
+      context: ./indexer
+      dockerfile: Dockerfile
+    container_name: dmcp-indexer-worker
+    environment:
+      - MCP_GATEWAY_URL=http://host.docker.internal:15000/config_dump
+      - REDIS_HOST=redis-vss
+      - REDIS_PORT=6379
+      - EMBEDDING_URL=http://embedding-service:7997
+      - SYNC_INTERVAL=${SYNC_INTERVAL:-60}
+    depends_on:
+      redis-vss:
+        condition: service_healthy
+      embedding-service:
+        condition: service_healthy
+    restart: unless-stopped
+    extra_hosts:
+      - "host.docker.internal:host-gateway"  # Access host network for Agent Gateway
+    networks:
+      - mcp-network
+    profiles:
+      - worker  # Only start with: docker-compose --profile worker up
+
+  # DMCP Indexer - One-shot indexing (manual run)
+  # Use: docker-compose run --rm indexer
+  indexer:
+    build:
+      context: ./indexer
+      dockerfile: Dockerfile
+    container_name: dmcp-indexer
+    environment:
+      - MCP_GATEWAY_URL=http://host.docker.internal:15000/config_dump
+      - REDIS_HOST=redis-vss
+      - REDIS_PORT=6379
+      - EMBEDDING_URL=http://embedding-service:7997
+    command: ["node", "dist/index.js"]  # One-shot mode (not worker)
+    depends_on:
+      redis-vss:
+        condition: service_healthy
+      embedding-service:
+        condition: service_healthy
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    networks:
+      - mcp-network
+    profiles:
+      - tools  # Only run manually: docker-compose run --rm indexer
+
+  # DMCP Server - MCP tool discovery via Streamable HTTP
+  dmcp-server:
+    build:
+      context: ./server
+      dockerfile: Dockerfile
+    container_name: dmcp-server
+    ports:
+      - "3001:3000"  # Expose MCP server on host port 3001
+    environment:
+      - REDIS_HOST=mcp-redis-vss
+      - REDIS_PORT=6379
+      - EMBEDDING_URL=http://mcp-embedding-infinity:7997
+      - DMCP_TOP_K=15
+      - DMCP_MIN_SCORE=0.3
+      - PORT=3000
+    depends_on:
+      redis-vss:
+        condition: service_healthy
+      embedding-service:
+        condition: service_started
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:3000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+    networks:
+      - mcp-network
+
 volumes:
   redis-vss-data:
     driver: local

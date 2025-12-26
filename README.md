@@ -172,20 +172,8 @@ cp .env.example .env
 docker-compose up -d
 
 # Verify services are healthy
-```bash
-# Start Redis VSS + Embedding Service
-docker-compose up -d
-
-# Verify services are healthy
 curl http://localhost:5000/health
 # → {"unix": 1703452800.0}
-
-# Test embedding model
-curl -X POST http://localhost:5000/embeddings \
-  -H "Content-Type: application/json" \
-  -d '{"input":"create a GitHub issue","model":"mangopy/ToolRet-trained-e5-large-v2","encoding_format":"float"}' \
-  | jq '.data[0].embedding | length'
-# → 1024
 
 docker exec mcp-redis-vss redis-cli ping
 # → PONG
@@ -196,24 +184,26 @@ docker exec mcp-redis-vss redis-cli ping
 ```bash
 cd gateway
 ./start.sh
-# Gateway exposes MCP servers on ports 3101-3120
+# Gateway exposes MCP servers on port 15000
 ```
 
 ### 4. Index Tools
 
+**Option A: Using Docker (recommended)**
+```bash
+# One-shot indexing via Docker
+docker-compose run --rm indexer
+
+# Or start the worker for continuous sync
+docker-compose --profile worker up -d
+```
+
+**Option B: Local Node.js**
 ```bash
 cd indexer
 npm install
-npm run index
-
-# Output:
-# ╔════════════════════════════════════════════════════════════════╗
-# ║                    DMCP Tool Indexer                           ║
-# ╚════════════════════════════════════════════════════════════════╝
-# ✔ Connected to Redis at localhost:6380
-# ✔ Discovering tools from MCP servers... (parallel, 10 concurrent)
-# ...
-# ✔ Indexed 429 tools in 45.2s
+npm run index         # One-shot
+npm run worker        # Continuous sync
 ```
 
 ### 5. Configure VS Code
@@ -236,6 +226,25 @@ Add to your `.vscode/mcp.json`:
     }
   }
 }
+```
+
+## 🐳 Docker Commands
+
+```bash
+# Start core infrastructure (Redis + Embedding)
+docker-compose up -d
+
+# Run one-shot indexing
+docker-compose run --rm indexer
+
+# Start indexer worker (continuous sync)
+docker-compose --profile worker up -d
+
+# View worker logs
+docker-compose logs -f indexer-worker
+
+# Stop everything
+docker-compose --profile worker down
 ```
 
 ## 🔍 How Search Works
