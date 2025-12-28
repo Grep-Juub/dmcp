@@ -72,13 +72,18 @@ let initPromise: Promise<void> | null = null;
  * Get the search_tools meta-tool definition
  */
 function getSearchToolDefinition(): Tool {
-  const description = [
-    `Search for relevant tools based on your task.`,
-    `This server has ${totalToolCount} tools indexed across multiple services`,
-    `(GitHub, Google Workspace, AWS, Kubernetes, Datadog, Grafana, Jira, etc.).`,
-    `Use this tool FIRST to discover which tools are available for your specific task.`,
-    `Returns the top ${topK} most relevant tools.`,
-  ].join(' ');
+  // Following best practices from Anthropic and dynamic tool discovery patterns:
+  // - Focus on WHAT it enables, not instructions
+  // - Be generic enough to handle unknown future tools
+  // - Mention categories, not exhaustive lists
+  // - Emphasize the discovery/unlock mechanism
+  const description = 
+    `Discover and enable tools by semantic search. ` +
+    `This server indexes ${totalToolCount} tools that become available after discovery. ` +
+    `Tools span many categories: external services (APIs, cloud platforms, issue trackers), ` +
+    `local operations (files, processes, system), reasoning & cognition (sequential thinking, planning), ` +
+    `knowledge & memory, web interaction, databases, and more. ` +
+    `Search with natural language describing your goal—matching tools are returned and become callable.`;
   
   return {
     name: 'search_tools',
@@ -88,11 +93,12 @@ function getSearchToolDefinition(): Tool {
       properties: {
         query: {
           type: 'string',
-          description: `Describe what you want to do. Examples: "create a GitHub issue", "search emails", "check Kubernetes pod status", "query AWS costs"`,
+          description: `What you want to accomplish. Can be an action ("send email"), ` +
+            `a capability ("reasoning"), a service name ("kubernetes"), or a goal ("analyze this step by step").`,
         },
         limit: {
           type: 'number',
-          description: `Maximum number of tools to return (default: ${topK}, max: 50)`,
+          description: `Maximum tools to return (default: ${topK}, max: 50)`,
         },
       },
       required: ['query'],
