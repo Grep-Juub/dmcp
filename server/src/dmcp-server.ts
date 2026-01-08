@@ -54,10 +54,135 @@ const redis = new RedisVSS({
 const topK = parseInt(process.env.DMCP_TOP_K || '15');
 const minScore = parseFloat(process.env.DMCP_MIN_SCORE || '0.3');
 
+// Connection configuration
+const CONNECTION_RETRY_ATTEMPTS = parseInt(process.env.DMCP_RETRY_ATTEMPTS || '3');
+const CONNECTION_RETRY_DELAY_MS = parseInt(process.env.DMCP_RETRY_DELAY_MS || '1000');
+const CONNECTION_HEALTH_INTERVAL_MS = parseInt(process.env.DMCP_HEALTH_INTERVAL_MS || '30000');
+const CONNECTION_TIMEOUT_MS = parseInt(process.env.DMCP_CONNECTION_TIMEOUT_MS || '10000');
+
 // Tool tracking (shared across sessions)
 let totalToolCount = 0;
-const toolServerUrls = new Map<string, string>();  // toolKey -> serverUrl
-const serverClients = new Map<string, Client>();   // serverId -> Client
+
+// ============================================================================
+// Backend Connection Manager with Keep-Alive and Retry
+// ============================================================================
+
+interface BackendConnection {
+  client: Client;
+  serverId: string;
+  url: string;
+  lastHealthCheck: number;
+  isHealthy: boolean;
+}
+
+const serverConnections = new Map<string, BackendConnection>();  // serverId -> BackendConnection
+let healthCheckInterval: NodeJS.Timeout | null = null;
+
+/**
+ * Check if a backend connection is healthy by attempting a simple operation
+ */
+async function checkConnectionHealth(conn: BackendConnection): Promise<boolean> {
+  try {
+    // Try to list tools as a health check - this validates the connection is alive
+    await Promise.race([
+      conn.client.listTools(),
+      new Promise((_, reject) => 
+        setTimeout(() => reject(new Error('Health check timeout')), 5000)
+      )
+    ]);
+    return true;
+  } catch (error) {
+    console.error(`${timestamp()} [DMCP] ⚠️ Health check failed for ${conn.serverId}: ${(error as Error).message}`);
+    return false;
+  }
+}
+
+/**
+ * Reconnect to a backend server
+ */
+async function reconnectBackend(conn: BackendConnection): Promise<boolean> {
+  console.error(`${timestamp()} [DMCP] 🔄 Reconnecting to ${conn.serverId}...`);
+  
+  // Close existing connection if any
+  try {
+    await conn.client.close();
+  } catch {
+    // Ignore close errors
+  }
+  
+  // Remove from map while reconnecting
+  serverConnections.delete(conn.serverId);
+  
+  // Try to reconnect
+  const newClient = await connectToBackendWithRetry(conn.serverId, conn.url);
+  if (newClient) {
+    serverConnections.set(conn.serverId, {
+      client: newClient,
+      serverId: conn.serverId,
+      url: conn.url,
+      lastHealthCheck: Date.now(),
+      isHealthy: true,
+    });
+    return true;
+  }
+  return false;
+}
+
+/**
+ * Periodic health check for all backend connections
+ */
+async function performHealthChecks(): Promise<void> {
+  const now = Date.now();
+  
+  for (const [serverId, conn] of serverConnections) {
+    // Skip if recently checked
+    if (now - conn.lastHealthCheck < CONNECTION_HEALTH_INTERVAL_MS) continue;
+    
+    conn.lastHealthCheck = now;
+    const isHealthy = await checkConnectionHealth(conn);
+    
+    if (!isHealthy) {
+      conn.isHealthy = false;
+      console.error(`${timestamp()} [DMCP] ⚠️ ${serverId} connection unhealthy, attempting reconnect...`);
+      
+      const reconnected = await reconnectBackend(conn);
+      if (!reconnected) {
+        console.error(`${timestamp()} [DMCP] ✗ Failed to reconnect to ${serverId}`);
+      }
+    } else if (!conn.isHealthy) {
+      // Was unhealthy, now healthy again
+      conn.isHealthy = true;
+      console.error(`${timestamp()} [DMCP] ✓ ${serverId} connection restored`);
+    }
+  }
+}
+
+/**
+ * Start the health check interval
+ */
+function startHealthChecks(): void {
+  if (healthCheckInterval) return;
+  
+  healthCheckInterval = setInterval(async () => {
+    try {
+      await performHealthChecks();
+    } catch (error) {
+      console.error(`${timestamp()} [DMCP] ✗ Health check error: ${(error as Error).message}`);
+    }
+  }, CONNECTION_HEALTH_INTERVAL_MS);
+  
+  console.error(`${timestamp()} [DMCP] ✓ Health checks started (interval: ${CONNECTION_HEALTH_INTERVAL_MS}ms)`);
+}
+
+/**
+ * Stop health checks (for shutdown)
+ */
+function stopHealthChecks(): void {
+  if (healthCheckInterval) {
+    clearInterval(healthCheckInterval);
+    healthCheckInterval = null;
+  }
+}
 
 // Initialization state
 let isInitialized = false;
@@ -121,7 +246,14 @@ function rewriteUrlForDocker(url: string): string {
 }
 
 /**
- * Connect to an SSE MCP Server (lazy - on demand)
+ * Sleep helper for retry delays
+ */
+function sleep(ms: number): Promise<void> {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+/**
+ * Connect to an SSE MCP Server with timeout
  */
 async function connectToBackend(serverId: string, url: string): Promise<Client | null> {
   const rewrittenUrl = rewriteUrlForDocker(url);
@@ -132,7 +264,15 @@ async function connectToBackend(serverId: string, url: string): Promise<Client |
       { name: 'dmcp-client', version: '1.0.0' },
       { capabilities: {} }
     );
-    await client.connect(transport);
+    
+    // Connect with timeout
+    await Promise.race([
+      client.connect(transport),
+      new Promise((_, reject) => 
+        setTimeout(() => reject(new Error(`Connection timeout after ${CONNECTION_TIMEOUT_MS}ms`)), CONNECTION_TIMEOUT_MS)
+      )
+    ]);
+    
     console.error(`${timestamp()} [DMCP] ✓ Connected to ${serverId}`);
     return client;
   } catch (error) {
@@ -142,21 +282,63 @@ async function connectToBackend(serverId: string, url: string): Promise<Client |
 }
 
 /**
- * Get or create a client connection to a backend server (lazy)
+ * Connect to backend with retry logic
+ */
+async function connectToBackendWithRetry(serverId: string, url: string): Promise<Client | null> {
+  for (let attempt = 1; attempt <= CONNECTION_RETRY_ATTEMPTS; attempt++) {
+    const client = await connectToBackend(serverId, url);
+    if (client) return client;
+    
+    if (attempt < CONNECTION_RETRY_ATTEMPTS) {
+      const delay = CONNECTION_RETRY_DELAY_MS * attempt; // Exponential backoff
+      console.error(`${timestamp()} [DMCP] ⏳ Retry ${attempt}/${CONNECTION_RETRY_ATTEMPTS} for ${serverId} in ${delay}ms...`);
+      await sleep(delay);
+    }
+  }
+  
+  console.error(`${timestamp()} [DMCP] ✗ All ${CONNECTION_RETRY_ATTEMPTS} connection attempts failed for ${serverId}`);
+  return null;
+}
+
+/**
+ * Get or create a client connection to a backend server (lazy, with retry)
  */
 async function getServerClient(serverId: string, serverUrl?: string): Promise<Client | null> {
-  if (serverClients.has(serverId)) {
-    console.error(`${timestamp()} [DMCP] ↩ Reusing connection to ${serverId}`);
-    return serverClients.get(serverId)!;
+  const existing = serverConnections.get(serverId);
+  
+  if (existing) {
+    // Check if connection is still healthy
+    if (existing.isHealthy) {
+      console.error(`${timestamp()} [DMCP] ↩ Reusing healthy connection to ${serverId}`);
+      return existing.client;
+    }
+    
+    // Connection marked unhealthy, try to reconnect
+    console.error(`${timestamp()} [DMCP] ⚠️ Connection to ${serverId} unhealthy, reconnecting...`);
+    const reconnected = await reconnectBackend(existing);
+    if (reconnected) {
+      return serverConnections.get(serverId)!.client;
+    }
+    return null;
   }
+  
   if (!serverUrl) {
     console.error(`${timestamp()} [DMCP] ✗ No server URL for: ${serverId}`);
     return null;
   }
 
-  const client = await connectToBackend(serverId, serverUrl);
+  const client = await connectToBackendWithRetry(serverId, serverUrl);
   if (client) {
-    serverClients.set(serverId, client);
+    serverConnections.set(serverId, {
+      client,
+      serverId,
+      url: serverUrl,
+      lastHealthCheck: Date.now(),
+      isHealthy: true,
+    });
+    
+    // Start health checks if not already running
+    startHealthChecks();
   }
   return client;
 }
@@ -237,7 +419,7 @@ function createServer(): McpServer {
   // Per-session tool state
   const exposedTools = new Map<string, { tool: Tool; serverUrl?: string }>();
 
-  // Helper function to handle dynamic tool calls
+  // Helper function to handle dynamic tool calls with retry on connection failure
   const handleDynamicToolCall = async (toolName: string, args: Record<string, unknown>): Promise<CallToolResult> => {
     console.error(`${timestamp()} [DMCP] 🔧 Tool call: ${toolName}`);
 
@@ -268,44 +450,83 @@ function createServer(): McpServer {
     }
 
     const { serverId, originalName } = parsed;
-
-    // Get backend client (lazy connect)
-    const client = await getServerClient(serverId, toolInfo.serverUrl);
-    if (!client) {
-      console.error(`${timestamp()} [DMCP] ✗ Cannot connect to ${serverId}`);
-      return {
-        content: [{
-          type: 'text',
-          text: `Cannot connect to backend: ${serverId}. The MCP server may not be running.`,
-        }],
-        isError: true,
-      };
-    }
-
     const argsStr = JSON.stringify(args);
-    console.error(`${timestamp()} [DMCP] → ${serverId}::${originalName}`);
-    console.error(`${timestamp()} [DMCP]   Args: ${argsStr.slice(0, 300)}${argsStr.length > 300 ? '...' : ''}`);
     
-    const startTime = Date.now();
-    try {
-      const result = await client.callTool({
-        name: originalName,
-        arguments: args,
-      });
-      const duration = Date.now() - startTime;
-      console.error(`${timestamp()} [DMCP] ✓ ${originalName} completed in ${duration}ms`);
-      return result as CallToolResult;
-    } catch (error) {
-      const duration = Date.now() - startTime;
-      console.error(`${timestamp()} [DMCP] ✗ ${originalName} failed after ${duration}ms: ${(error as Error).message}`);
-      return {
-        content: [{
-          type: 'text',
-          text: `Error calling ${originalName}: ${(error as Error).message}`,
-        }],
-        isError: true,
-      };
+    // Retry loop for connection failures
+    for (let attempt = 1; attempt <= CONNECTION_RETRY_ATTEMPTS; attempt++) {
+      // Get backend client (lazy connect)
+      const client = await getServerClient(serverId, toolInfo.serverUrl);
+      if (!client) {
+        if (attempt === CONNECTION_RETRY_ATTEMPTS) {
+          console.error(`${timestamp()} [DMCP] ✗ Cannot connect to ${serverId} after ${attempt} attempts`);
+          return {
+            content: [{
+              type: 'text',
+              text: `Cannot connect to backend: ${serverId}. The MCP server may not be running.`,
+            }],
+            isError: true,
+          };
+        }
+        console.error(`${timestamp()} [DMCP] ⏳ Connection failed, retry ${attempt}/${CONNECTION_RETRY_ATTEMPTS}...`);
+        await sleep(CONNECTION_RETRY_DELAY_MS * attempt);
+        continue;
+      }
+
+      console.error(`${timestamp()} [DMCP] → ${serverId}::${originalName} (attempt ${attempt})`);
+      console.error(`${timestamp()} [DMCP]   Args: ${argsStr.slice(0, 300)}${argsStr.length > 300 ? '...' : ''}`);
+      
+      const startTime = Date.now();
+      try {
+        const result = await client.callTool({
+          name: originalName,
+          arguments: args,
+        });
+        const duration = Date.now() - startTime;
+        console.error(`${timestamp()} [DMCP] ✓ ${originalName} completed in ${duration}ms`);
+        return result as CallToolResult;
+      } catch (error) {
+        const duration = Date.now() - startTime;
+        const errorMessage = (error as Error).message;
+        console.error(`${timestamp()} [DMCP] ✗ ${originalName} failed after ${duration}ms: ${errorMessage}`);
+        
+        // Check if this is a connection error that warrants retry
+        const isConnectionError = errorMessage.includes('ECONNRESET') ||
+          errorMessage.includes('ECONNREFUSED') ||
+          errorMessage.includes('socket hang up') ||
+          errorMessage.includes('network') ||
+          errorMessage.includes('timeout') ||
+          errorMessage.includes('closed');
+        
+        if (isConnectionError && attempt < CONNECTION_RETRY_ATTEMPTS) {
+          // Mark connection as unhealthy for reconnection
+          const conn = serverConnections.get(serverId);
+          if (conn) {
+            conn.isHealthy = false;
+          }
+          console.error(`${timestamp()} [DMCP] ⚠️ Connection error detected, will retry...`);
+          await sleep(CONNECTION_RETRY_DELAY_MS * attempt);
+          continue;
+        }
+        
+        // Non-connection error or final attempt
+        return {
+          content: [{
+            type: 'text',
+            text: `Error calling ${originalName}: ${errorMessage}`,
+          }],
+          isError: true,
+        };
+      }
     }
+    
+    // Should not reach here, but just in case
+    return {
+      content: [{
+        type: 'text',
+        text: `Unexpected error: retry loop exhausted for ${originalName}`,
+      }],
+      isError: true,
+    };
   };
   
   // Register the search_tools meta-tool
@@ -353,9 +574,6 @@ function createServer(): McpServer {
           },
           serverUrl: tool.serverUrl,
         });
-        if (tool.serverUrl) {
-          toolServerUrls.set(toolKey, tool.serverUrl);
-        }
 
         // Dynamically register the tool
         // Using the generic z.record for arbitrary input schemas
@@ -429,10 +647,27 @@ function log(message: string, sessionId?: string): void {
 // Health check endpoint
 app.get('/health', (_req: Request, res: Response) => {
   const activeSessions = Object.keys(transports).length;
+  const backendConnections = Array.from(serverConnections.entries()).map(([id, conn]) => ({
+    serverId: id,
+    healthy: conn.isHealthy,
+    lastCheck: conn.lastHealthCheck,
+  }));
+  
   res.json({
     status: isInitialized ? 'healthy' : 'initializing',
     toolCount: totalToolCount,
     activeSessions,
+    backendConnections: {
+      total: serverConnections.size,
+      healthy: backendConnections.filter(c => c.healthy).length,
+      details: backendConnections,
+    },
+    config: {
+      retryAttempts: CONNECTION_RETRY_ATTEMPTS,
+      retryDelayMs: CONNECTION_RETRY_DELAY_MS,
+      healthIntervalMs: CONNECTION_HEALTH_INTERVAL_MS,
+      connectionTimeoutMs: CONNECTION_TIMEOUT_MS,
+    },
     uptime: Math.floor(process.uptime()),
     error: initializationError?.message,
   });
@@ -583,6 +818,25 @@ app.listen(PORT, '0.0.0.0', () => {
 // Graceful shutdown
 process.on('SIGINT', async () => {
   console.error(`${timestamp()} [DMCP] 🛑 Shutting down (SIGINT)...`);
+  
+  // Stop health checks
+  stopHealthChecks();
+  console.error(`${timestamp()} [DMCP]    Health checks stopped`);
+  
+  // Close backend connections
+  const backendCount = serverConnections.size;
+  if (backendCount > 0) {
+    console.error(`${timestamp()} [DMCP]    Closing ${backendCount} backend connections...`);
+    for (const [serverId, conn] of serverConnections) {
+      try {
+        await conn.client.close();
+        console.error(`${timestamp()} [DMCP]    ✓ Closed ${serverId}`);
+      } catch (error) {
+        console.error(`${timestamp()} [DMCP]    ✗ Error closing ${serverId}: ${(error as Error).message}`);
+      }
+    }
+    serverConnections.clear();
+  }
   
   const sessionCount = Object.keys(transports).length;
   if (sessionCount > 0) {
