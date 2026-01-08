@@ -55,11 +55,11 @@ services:
           cpus: '2'
           memory: 3G
     healthcheck:
-      test: ["CMD", "wget", "--spider", "-q", "http://localhost:7997/health"]
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:7997/health', timeout=5)"]
       interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 120s  # First download takes longer
+      timeout: 15s
+      retries: 5
+      start_period: 300s  # Model loading can take up to 5 minutes
     networks:
       - mcp-network
 
