@@ -67,7 +67,7 @@ LLM calls: github_create_issue(...)
 │                                │                │     (via Agent Gateway)    │
 │  • Vector Index (HNSW)         │                │                            │
 │  • COSINE similarity           │                │  • GitHub, Jira, Confluence│
-│  • 400+ tools indexed          │                │  • Google Workspace        │
+│  • 400+ tools indexed          │                │  • Google Workspace, Notion│
 └────────────────────────────────┘                │  • Kubernetes, AWS, Azure  │
              ▲                                    │  • And more...             │
              │                                    └────────────────────────────┘
@@ -222,6 +222,7 @@ Example queries:
 | `"ticket management"` | Jira tools |
 | `"check pod logs"` | Kubernetes tools |
 | `"search emails"` | Google Workspace |
+| `"query Notion database"` | Notion tools |
 
 ## 🏥 Health & Monitoring
 
@@ -304,6 +305,42 @@ REDIS_PORT=6380 EMBEDDING_URL=http://localhost:5000 npm run start
 # Run tests
 npm test
 ```
+
+## ➕ Adding MCP Servers
+
+DMCP works with any MCP server. Example configurations are in `gateway/config_parts/`.
+
+### Notion MCP Server
+
+[Notion MCP](https://developers.notion.com/docs/mcp) provides tools for searching, reading, and creating Notion pages/databases.
+
+1. Create a Notion integration at [notion.so/my-integrations](https://www.notion.so/my-integrations)
+2. Add to your gateway config (`gateway/config_parts/70-notion.yaml`):
+
+```yaml
+targets:
+  - name: notion
+    type: mcp
+    target_config:
+      command: npx
+      args:
+        - -y
+        - "@notionhq/notion-mcp-server"
+      env:
+        OPENAPI_MCP_HEADERS: '{"Authorization": "Bearer ${NOTION_API_KEY}", "Notion-Version": "2022-06-28"}'
+```
+
+3. Set your API key: `export NOTION_API_KEY=ntn_...`
+4. Restart gateway and re-index: `docker compose run --rm indexer`
+
+### Other Popular MCP Servers
+
+| Server | Package | Documentation |
+|--------|---------|---------------|
+| GitHub | `@modelcontextprotocol/server-github` | [GitHub MCP](https://github.com/modelcontextprotocol/servers/tree/main/src/github) |
+| Slack | `@modelcontextprotocol/server-slack` | [Slack MCP](https://github.com/modelcontextprotocol/servers/tree/main/src/slack) |
+| Google Drive | `@modelcontextprotocol/server-gdrive` | [GDrive MCP](https://github.com/modelcontextprotocol/servers/tree/main/src/gdrive) |
+| PostgreSQL | `@modelcontextprotocol/server-postgres` | [Postgres MCP](https://github.com/modelcontextprotocol/servers/tree/main/src/postgres) |
 
 ## 📊 Performance
 
